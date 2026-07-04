@@ -99,12 +99,13 @@ class ServerState:
 
     def __init__(self, mimi: MimiModel, other_mimi: MimiModel, text_tokenizer: sentencepiece.SentencePieceProcessor,
                  lm: LMModel, device: str | torch.device, voice_prompt_dir: str | None = None,
-                 save_voice_prompt_embeddings: bool = False):
+                 save_voice_prompt_embeddings: bool = False, mute_recovery_secs: float = 0.0):
         self.mimi = mimi
         self.other_mimi = other_mimi
         self.text_tokenizer = text_tokenizer
         self.device = device
         self.voice_prompt_dir = voice_prompt_dir
+        self.mute_recovery_secs = mute_recovery_secs
         self.frame_size = int(self.mimi.sample_rate / self.mimi.frame_rate)
         self.lm_gen = LMGen(lm,
                             audio_silence_frame_cnt=int(0.5 * self.mimi.frame_rate),
@@ -141,6 +142,9 @@ class ServerState:
     def _watchdog_loop(self, timeout: float = 8.0, poll_interval: float = 2.0):
         while True:
             time.sleep(poll_interval)
+            if self.watchdog_label == "idle":
+                # No active session -- nothing is supposed to be making progress.
+                continue
             stalled_for = time.time() - self.watchdog_ts
             if stalled_for > timeout and not self._watchdog_reported:
                 self._watchdog_reported = True
@@ -263,11 +267,74 @@ class ServerState:
             frames_since_report = 0
             processing_time_since_report = 0.0
             last_report = time.time()
+            # Content-level tracking: the mechanical pipeline can be perfectly healthy while the
+            # model itself has gone "mute" (generating only PAD text tokens and silent audio,
+            # forever). Track when the model last said anything and how loud its output is so the
+            # perf log distinguishes "pipeline broken" from "model went silent".
+            last_text_time = time.time()
+            text_tokens_since_report = 0
+            out_sq_sum = 0.0
+            out_sample_cnt = 0
+            recovery_count = 0
 
             while True:
                 if close:
                     return
                 await asyncio.sleep(0.001)
+
+                if self.mute_recovery_secs > 0 and (time.time() - last_text_time) > self.mute_recovery_secs:
+                    # The model has not produced a single word in `mute_recovery_secs`. In our
+                    # observed failure mode this state is permanent (the persona/system prompt has
+                    # rotated out of the model's fixed 3000-step attention window and generation
+                    # degenerates into endless PAD tokens), so rather than stay silent forever we
+                    # re-prime the persona *inside the same connection*: reset the streaming
+                    # states and replay the voice + text prompts, exactly like connection setup.
+                    recovery_count += 1
+                    clog.log(
+                        "warning",
+                        f"model produced no text for {time.time() - last_text_time:.0f}s -- "
+                        f"re-priming persona in-session (recovery #{recovery_count}, "
+                        f"takes roughly as long as the initial connect pause)",
+                    )
+                    reprime_start = time.time()
+                    last_keepalive = 0.0
+
+                    async def alive_midsession():
+                        # Unlike the connection-setup `is_alive`, this must NOT call ws.receive()
+                        # (recv_loop is running concurrently and aiohttp forbids two concurrent
+                        # receives). It yields to the event loop so recv_loop/send_loop/heartbeat
+                        # keep running, and sends an in-band ping (0x06, understood and ignored by
+                        # the web client) every few seconds so the client's inactivity watchdog
+                        # doesn't kill the connection during this deliberately-quiet stretch.
+                        nonlocal last_keepalive
+                        if close or ws.closed:
+                            return False
+                        # Refresh the hang watchdog too: a long re-prime is deliberate work,
+                        # not a stall, and shouldn't trigger stack dumps.
+                        self._mark_progress("opus_loop: mute recovery (re-priming persona)")
+                        await asyncio.sleep(0.001)
+                        if time.time() - last_keepalive > 5.0:
+                            last_keepalive = time.time()
+                            await ws.send_bytes(b"\x06")
+                        return True
+
+                    self._mark_progress("opus_loop: mute recovery (re-priming persona)")
+                    self.mimi.reset_streaming()
+                    self.other_mimi.reset_streaming()
+                    self.lm_gen.reset_streaming()
+                    await self.lm_gen.step_system_prompts_async(self.mimi, is_alive=alive_midsession)
+                    self.mimi.reset_streaming()
+                    # Drop mic audio that piled up while the model was being re-primed (it was
+                    # "deaf" during that window; feeding it stale audio would only confuse it).
+                    _ = opus_reader.read_pcm()
+                    all_pcm_data = None
+                    last_text_time = time.time()
+                    clog.log(
+                        "warning",
+                        f"persona re-primed in {time.time() - reprime_start:.1f}s; conversation resumes",
+                    )
+                    continue
+
                 pcm = opus_reader.read_pcm()
                 if pcm.shape[-1] == 0:
                     continue
@@ -299,9 +366,14 @@ class ServerState:
                         self._mark_progress("opus_loop: main_pcm.cpu()")
                         main_pcm = main_pcm.cpu()
                         self._mark_progress("opus_loop: opus_writer.append_pcm")
-                        opus_writer.append_pcm(main_pcm[0, 0].numpy())
+                        pcm_out = main_pcm[0, 0].numpy()
+                        opus_writer.append_pcm(pcm_out)
+                        out_sq_sum += float(np.square(pcm_out).sum())
+                        out_sample_cnt += pcm_out.shape[-1]
                         text_token = tokens[0, 0, 0].item()
                         if text_token not in (0, 3):
+                            text_tokens_since_report += 1
+                            last_text_time = time.time()
                             _text = self.text_tokenizer.id_to_piece(text_token)  # type: ignore
                             _text = _text.replace("▁", " ")
                             msg = b"\x02" + bytes(_text, encoding="utf8")
@@ -319,14 +391,20 @@ class ServerState:
                     backlog_s = (0 if all_pcm_data is None else all_pcm_data.shape[-1]) / self.mimi.sample_rate
                     budget_s = frames_since_report * frame_wall_time
                     rtf = (processing_time_since_report / budget_s) if budget_s > 0 else 0.0
+                    out_rms = (out_sq_sum / out_sample_cnt) ** 0.5 if out_sample_cnt > 0 else 0.0
                     clog.log(
                         "info" if rtf < 0.9 else "warning",
                         f"perf: {frames_since_report} frames in last {now - last_report:.1f}s, "
-                        f"processing/real-time ratio={rtf:.2f}, unprocessed input backlog={backlog_s:.2f}s",
+                        f"processing/real-time ratio={rtf:.2f}, unprocessed input backlog={backlog_s:.2f}s, "
+                        f"text_tokens={text_tokens_since_report}, out_rms={out_rms:.4f}, "
+                        f"last_text={now - last_text_time:.0f}s ago",
                     )
                     last_report = now
                     frames_since_report = 0
                     processing_time_since_report = 0.0
+                    text_tokens_since_report = 0
+                    out_sq_sum = 0.0
+                    out_sample_cnt = 0
 
         async def send_loop():
             while True:
@@ -401,6 +479,7 @@ class ServerState:
                 await ws.close()
                 clog.log("info", "session closed")
                 # await asyncio.gather(opus_loop(), recv_loop(), send_loop())
+        self._mark_progress("idle")
         clog.log("info", "done with connection")
         return ws
 
@@ -503,6 +582,12 @@ def main():
     parser.add_argument("--cpu-offload", action="store_true",
                         help="Offload LM model layers to CPU when GPU memory is insufficient. "
                              "Requires 'accelerate' package.")
+    parser.add_argument("--mute-recovery-secs", type=float, default=0.0,
+                        help="If > 0 and the model produces no text for this many seconds "
+                             "mid-conversation (the 'goes permanently silent after a few minutes' "
+                             "failure mode), automatically reset and replay the voice/text prompts "
+                             "inside the same connection so the conversation can continue. "
+                             "0 disables recovery (default).")
     parser.add_argument(
         "--voice-prompt-dir",
         type=str,
@@ -583,6 +668,7 @@ def main():
         device=args.device,
         voice_prompt_dir=args.voice_prompt_dir,
         save_voice_prompt_embeddings=False,
+        mute_recovery_secs=args.mute_recovery_secs,
     )
     logger.info("warming up the model")
     state.warmup()
