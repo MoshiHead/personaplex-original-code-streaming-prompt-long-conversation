@@ -32,6 +32,7 @@ import os
 from pathlib import Path
 import signal
 import tarfile
+import threading
 import time
 import secrets
 import sys
@@ -117,7 +118,45 @@ class ServerState:
         self.mimi.streaming_forever(1)
         self.other_mimi.streaming_forever(1)
         self.lm_gen.streaming_forever(1)
-    
+
+        # Watchdog: the per-frame perf log showed steady, healthy processing right up until it
+        # abruptly stops producing any output at all -- a sudden hang mid-frame, not a gradual
+        # slowdown. `py-spy`/ptrace is unavailable in this container, so instead of relying on an
+        # external tool or a manually-sent signal, a background thread inside this same process
+        # watches a "last progress" timestamp that the hot loop below updates before every
+        # individual sub-step (encode / each LM step / decode / send). If that timestamp stops
+        # advancing for longer than `watchdog_timeout`, the watchdog thread (which keeps running
+        # even if the main thread is blocked inside a C/CUDA call, as long as that call releases
+        # the GIL while waiting) dumps every thread's current Python stack straight to the log --
+        # showing exactly which named sub-step it was stuck in, automatically, the moment it hangs.
+        self.watchdog_label = "idle"
+        self.watchdog_ts = time.time()
+        self._watchdog_reported = False
+
+    def _mark_progress(self, label: str):
+        self.watchdog_label = label
+        self.watchdog_ts = time.time()
+        self._watchdog_reported = False
+
+    def _watchdog_loop(self, timeout: float = 8.0, poll_interval: float = 2.0):
+        while True:
+            time.sleep(poll_interval)
+            stalled_for = time.time() - self.watchdog_ts
+            if stalled_for > timeout and not self._watchdog_reported:
+                self._watchdog_reported = True
+                lines = [
+                    "",
+                    "=" * 20 + f" WATCHDOG: no progress for {stalled_for:.1f}s "
+                    f"(stuck at step: {self.watchdog_label!r}) " + "=" * 20,
+                ]
+                for thread_id, thread_frame in sys._current_frames().items():
+                    lines.append(f"thread {thread_id}:")
+                    lines.extend(
+                        "  " + line for line in "".join(traceback.format_stack(thread_frame)).splitlines()
+                    )
+                lines.append("=" * 60)
+                print("\n".join(lines), file=sys.stderr, flush=True)
+
     def warmup(self):
         for _ in range(4):
             chunk = torch.zeros(1, 1, self.frame_size, dtype=torch.float32, device=self.device)
@@ -238,32 +277,42 @@ class ServerState:
                     all_pcm_data = np.concatenate((all_pcm_data, pcm))
                 while all_pcm_data.shape[-1] >= self.frame_size:
                     be = time.time()
+                    self._mark_progress("opus_loop: slicing/transfer chunk")
                     chunk = all_pcm_data[: self.frame_size]
                     all_pcm_data = all_pcm_data[self.frame_size:]
                     chunk = torch.from_numpy(chunk)
                     chunk = chunk.to(device=self.device)[None, None]
+                    self._mark_progress("opus_loop: mimi.encode")
                     codes = self.mimi.encode(chunk)
+                    self._mark_progress("opus_loop: other_mimi.encode")
                     _ = self.other_mimi.encode(chunk)
                     for c in range(codes.shape[-1]):
+                        self._mark_progress(f"opus_loop: lm_gen.step (c={c}/{codes.shape[-1]}, offset={self.lm_gen._streaming_state.offset})")
                         tokens = self.lm_gen.step(codes[:, :, c: c + 1])
                         if tokens is None:
                             continue
                         assert tokens.shape[1] == self.lm_gen.lm_model.dep_q + 1
+                        self._mark_progress("opus_loop: mimi.decode")
                         main_pcm = self.mimi.decode(tokens[:, 1:9])
+                        self._mark_progress("opus_loop: other_mimi.decode")
                         _ = self.other_mimi.decode(tokens[:, 1:9])
+                        self._mark_progress("opus_loop: main_pcm.cpu()")
                         main_pcm = main_pcm.cpu()
+                        self._mark_progress("opus_loop: opus_writer.append_pcm")
                         opus_writer.append_pcm(main_pcm[0, 0].numpy())
                         text_token = tokens[0, 0, 0].item()
                         if text_token not in (0, 3):
                             _text = self.text_tokenizer.id_to_piece(text_token)  # type: ignore
                             _text = _text.replace("▁", " ")
                             msg = b"\x02" + bytes(_text, encoding="utf8")
+                            self._mark_progress("opus_loop: ws.send_bytes (text)")
                             await ws.send_bytes(msg)
                         else:
                             text_token_map = ['EPAD', 'BOS', 'EOS', 'PAD']
 
                     processing_time_since_report += time.time() - be
                     frames_since_report += 1
+                    self._mark_progress("opus_loop: between frames")
 
                 now = time.time()
                 if now - last_report >= 5.0:
@@ -284,8 +333,10 @@ class ServerState:
                 if close:
                     return
                 await asyncio.sleep(0.001)
+                self._mark_progress("send_loop: opus_writer.read_bytes")
                 msg = opus_writer.read_bytes()
                 if len(msg) > 0:
+                    self._mark_progress("send_loop: ws.send_bytes (audio)")
                     await ws.send_bytes(b"\x01" + msg)
 
         clog.log("info", "accepted connection")
@@ -535,6 +586,7 @@ def main():
     )
     logger.info("warming up the model")
     state.warmup()
+    threading.Thread(target=state._watchdog_loop, daemon=True, name="hang-watchdog").start()
     app = web.Application()
     app.router.add_get("/api/chat", state.handle_chat)
     if static_path is not None:
