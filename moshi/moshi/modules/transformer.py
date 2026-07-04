@@ -260,6 +260,29 @@ class RingKVCache:
     def reset(self):
         self.end_offset.zero_()
 
+    def stats(self) -> dict:
+        """Cheap, tensor-free snapshot of this cache's position -- for diagnostic logging
+        only (see server.py's --diag-interval-secs instrumentation). Never returns the
+        actual key/value tensors, only shapes/positions/counters. Calling this does one
+        `.item()` sync (reads `end_offset` off the GPU) -- call it at a reporting interval
+        or snapshot point, never per model step (that would add a GPU sync 12.5x/sec per
+        layer, which is exactly the overhead this instrumentation is designed to avoid).
+        """
+        end_offset = int(self.end_offset.item())
+        write_pointer = end_offset % self.capacity
+        wrap_count = end_offset // self.capacity
+        newest_position = end_offset - 1
+        oldest_position = max(0, end_offset - self.capacity)
+        return {
+            "capacity": self.capacity,
+            "end_offset": end_offset,
+            "wrap_count": wrap_count,
+            "write_pointer": write_pointer,
+            "oldest_position": oldest_position,
+            "newest_position": newest_position,
+            "pct_full": round(100.0 * min(end_offset, self.capacity) / self.capacity, 1),
+        }
+
     def complete(self, k: torch.Tensor, v: torch.Tensor) -> KVCacheResult:
         assert k.shape[:-1] == v.shape[:-1], (k.shape, v.shape)
         B, H, T, D = k.shape

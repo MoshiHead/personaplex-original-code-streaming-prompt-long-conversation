@@ -28,6 +28,7 @@ import argparse
 import asyncio
 from dataclasses import dataclass
 import random
+import json
 import os
 from pathlib import Path
 import signal
@@ -52,7 +53,7 @@ from .client_utils import make_log, colorize
 from .models import loaders, MimiModel, LMModel, LMGen
 from .modules.streaming import _flatten_streaming_state
 from .utils.connection import create_ssl_context, get_lan_ip
-from .utils.logging import setup_logger, ColorizedLog
+from .utils.logging import setup_logger, ColorizedLog, random_id
 
 
 logger = setup_logger(__name__)
@@ -100,13 +101,17 @@ class ServerState:
 
     def __init__(self, mimi: MimiModel, other_mimi: MimiModel, text_tokenizer: sentencepiece.SentencePieceProcessor,
                  lm: LMModel, device: str | torch.device, voice_prompt_dir: str | None = None,
-                 save_voice_prompt_embeddings: bool = False, mute_recovery_secs: float = 0.0):
+                 save_voice_prompt_embeddings: bool = False, mute_recovery_secs: float = 0.0,
+                 diag_interval_secs: float = 5.0, diag_probs: bool = False, diag_dir: str = "."):
         self.mimi = mimi
         self.other_mimi = other_mimi
         self.text_tokenizer = text_tokenizer
         self.device = device
         self.voice_prompt_dir = voice_prompt_dir
         self.mute_recovery_secs = mute_recovery_secs
+        self.diag_interval_secs = diag_interval_secs
+        self.diag_probs = diag_probs
+        self.diag_dir = diag_dir
         self.frame_size = int(self.mimi.sample_rate / self.mimi.frame_rate)
         self.lm_gen = LMGen(lm,
                             audio_silence_frame_cnt=int(0.5 * self.mimi.frame_rate),
@@ -114,8 +119,13 @@ class ServerState:
                             device=device,
                             frame_rate=self.mimi.frame_rate,
                             save_voice_prompt_embeddings=save_voice_prompt_embeddings,
+                            return_logits=diag_probs,
         )
-        
+
+        os.makedirs(diag_dir, exist_ok=True)
+        self._diag_path = os.path.join(diag_dir, "personaplex_diag.jsonl")
+        self._diag_fh = open(self._diag_path, "a", encoding="utf-8")
+
         self.lock = asyncio.Lock()
         self.mimi.streaming_forever(1)
         self.other_mimi.streaming_forever(1)
@@ -186,13 +196,127 @@ class ServerState:
                 lines.append("=" * 60)
                 print("\n".join(lines), file=sys.stderr, flush=True)
 
+    # ------------------------------------------------------------------
+    # Forensic instrumentation for the "goes silent at ~6:05, deterministically,
+    # regardless of conversation content" investigation. Everything under this banner
+    # is purely observational: it never changes model behavior, only records it.
+    # See the final report (posted alongside this change) for what to look at first.
+    # ------------------------------------------------------------------
+
+    def _diag_write(self, record: dict) -> None:
+        record.setdefault("wall_time", time.time())
+        self._diag_fh.write(json.dumps(record, default=str) + "\n")
+        self._diag_fh.flush()
+
+    def _diag_event(self, conn_id: str, clog, kind: str, **fields) -> None:
+        """Log a discrete, timestamped event to both the JSONL diag stream (machine-
+        readable) and the human-readable server log (so it's visible without needing to
+        open a second file)."""
+        rec = {"record_type": "event", "conn_id": conn_id, "event": kind}
+        rec.update(fields)
+        self._diag_write(rec)
+        summary = " ".join(f"{k}={v}" for k, v in fields.items())
+        clog.log("warning", f"DIAG EVENT [{kind}] {summary}")
+
+    def _diag_gpu_cpu_stats(self) -> dict:
+        stats: dict = {}
+        try:
+            stats["gpu_util_pct"] = torch.cuda.utilization()
+        except Exception:
+            stats["gpu_util_pct"] = None
+        try:
+            stats["gpu_mem_allocated_mb"] = round(torch.cuda.memory_allocated() / 1e6, 1)
+            stats["gpu_mem_reserved_mb"] = round(torch.cuda.memory_reserved() / 1e6, 1)
+        except Exception:
+            stats["gpu_mem_allocated_mb"] = None
+            stats["gpu_mem_reserved_mb"] = None
+        try:
+            stats["cpu_load_avg_1m"] = os.getloadavg()[0]
+        except (AttributeError, OSError):
+            stats["cpu_load_avg_1m"] = None
+        return stats
+
+    def _diag_task_summary(self) -> list:
+        out = []
+        try:
+            tasks = asyncio.all_tasks()
+        except RuntimeError:
+            tasks = []
+        for t in tasks:
+            exc = None
+            if t.done() and not t.cancelled():
+                try:
+                    e = t.exception()
+                    exc = repr(e) if e is not None else None
+                except asyncio.CancelledError:
+                    exc = "cancelled"
+            out.append({
+                "name": t.get_name(),
+                "done": t.done(),
+                "cancelled": t.cancelled() if t.done() else False,
+                "exception": exc,
+            })
+        return out
+
+    def _diag_snapshot(self, conn_id: str, label: str, elapsed: float, extra: dict | None = None) -> dict:
+        """Write a full forensic snapshot to its own JSON file (metadata only, never raw
+        tensor contents) and a pointer record to the JSONL stream. Safe to call rarely
+        (a handful of times per connection) -- unsafe to call every step (per-layer
+        `.stats()` does a GPU sync per layer)."""
+        snap = {
+            "record_type": "snapshot",
+            "conn_id": conn_id,
+            "label": label,
+            "wall_time": time.time(),
+            "elapsed_session_s": round(elapsed, 2),
+            "lm_gen": self.lm_gen.diagnostic_snapshot(per_layer=True),
+            "gpu_cpu": self._diag_gpu_cpu_stats(),
+            "asyncio_tasks": self._diag_task_summary(),
+        }
+        if extra:
+            snap.update(extra)
+        path = os.path.join(self.diag_dir, f"snapshot_{conn_id}_{label}.json")
+        with open(path, "w", encoding="utf-8") as f:
+            json.dump(snap, f, indent=2, default=str)
+        self._diag_write({
+            "record_type": "snapshot_ref", "conn_id": conn_id, "label": label,
+            "elapsed_session_s": round(elapsed, 2), "path": path,
+        })
+        return snap
+
+    @staticmethod
+    def _diag_diff(a: dict, b: dict, path: str = "") -> list:
+        """Generic recursive diff between two (possibly nested) diagnostic dicts/lists of
+        dicts. Returns a flat list of (dotted_path, old_value, new_value) for every leaf
+        that differs. Used to automatically compare the session-start snapshot against
+        the silence-onset snapshot."""
+        diffs: list = []
+        if isinstance(a, dict) and isinstance(b, dict):
+            for k in sorted(set(a.keys()) | set(b.keys())):
+                p = f"{path}.{k}" if path else k
+                diffs.extend(ServerState._diag_diff(a.get(k, "<missing>"), b.get(k, "<missing>"), p))
+        elif isinstance(a, list) and isinstance(b, list) and len(a) == len(b) and \
+                all(isinstance(x, dict) for x in a) and all(isinstance(x, dict) for x in b):
+            for i, (ea, eb) in enumerate(zip(a, b)):
+                diffs.extend(ServerState._diag_diff(ea, eb, f"{path}[{i}]"))
+        else:
+            if a != b:
+                diffs.append((path, a, b))
+        return diffs
+
     def warmup(self):
         for _ in range(4):
             chunk = torch.zeros(1, 1, self.frame_size, dtype=torch.float32, device=self.device)
             codes = self.mimi.encode(chunk)
             _ = self.other_mimi.encode(chunk)
             for c in range(codes.shape[-1]):
-                tokens = self.lm_gen.step(codes[:, :, c: c + 1])
+                # When --diag-probs is on, LMGen was constructed with return_logits=True, so
+                # step() always returns a (tokens, logits) 2-tuple instead of just tokens --
+                # including during this warmup, before any connection exists.
+                if self.diag_probs:
+                    tokens, _logits = self.lm_gen.step(codes[:, :, c: c + 1])
+                else:
+                    tokens = self.lm_gen.step(codes[:, :, c: c + 1])
                 if tokens is None:
                     continue
                 _ = self.mimi.decode(tokens[:, 1:9])
@@ -215,9 +339,11 @@ class ServerState:
         ws = web.WebSocketResponse(heartbeat=15)
         await ws.prepare(request)
         clog = ColorizedLog.randomize()
+        diag_conn_id = random_id()
         peer = request.remote  # IP
         peer_port = request.transport.get_extra_info("peername")[1]  # Port
         clog.log("info", f"Incoming connection from {peer}:{peer_port}")
+        clog.log("info", f"diag_conn_id={diag_conn_id} diag_file={self._diag_path}")
 
         # self.lm_gen.temp = float(request.query["audio_temperature"])
         # self.lm_gen.temp_text = float(request.query["text_temperature"])
@@ -249,6 +375,21 @@ class ServerState:
         self.lm_gen.text_prompt_tokens = self.text_tokenizer.encode(wrap_with_system_tags(request.query["text_prompt"])) if len(request.query["text_prompt"]) > 0 else None
         seed = int(request["seed"]) if "seed" in request.query else None
 
+        # Shared, mutable diagnostic counters -- a plain dict works across the three
+        # coroutines below without needing `nonlocal` for each field (only reassigning
+        # the name `diag_state` itself would need that; mutating its contents doesn't).
+        diag_state = {
+            "bytes_received": 0,
+            "bytes_sent_audio": 0,
+            "bytes_sent_text": 0,
+            "pcm_frames_received": 0,
+            "mimi_encode_calls": 0,
+            "encoded_code_frames": 0,
+            "pcm_frames_decoded": 0,
+            "ws_last_recv_time": time.time(),
+            "ws_last_send_time": time.time(),
+        }
+
         async def recv_loop():
             nonlocal close
             try:
@@ -274,38 +415,71 @@ class ServerState:
                     if kind == 1:  # audio
                         payload = message[1:]
                         opus_reader.append_bytes(payload)
+                        diag_state["bytes_received"] += len(payload)
+                        diag_state["ws_last_recv_time"] = time.time()
                     else:
                         clog.log("warning", f"unknown message kind {kind}")
+            except Exception as exc:
+                self._diag_event(diag_conn_id, clog, "exception", where="recv_loop",
+                                  exception=repr(exc), traceback=traceback.format_exc())
+                raise
             finally:
                 close = True
+                self._diag_event(diag_conn_id, clog, "websocket_disconnect",
+                                  where="recv_loop", ws_closed=ws.closed)
                 clog.log("info", "connection closed")
 
         async def opus_loop():
             all_pcm_data = None
-            # Real-time-factor tracking: each `frame_size` chunk represents a fixed slice of
-            # wall-clock audio time. If processing one chunk takes longer than that, we are
-            # falling behind real time and the backlog in `all_pcm_data` will only ever grow --
-            # from the client's perspective this looks exactly like a "frozen" conversation
-            # (the connection stays open and audio keeps trickling out, just increasingly late)
-            # even though the GPU is still busy grinding through a queue of stale input.
             frame_wall_time = self.frame_size / self.mimi.sample_rate
             frames_since_report = 0
             processing_time_since_report = 0.0
+            encode_time_since_report = 0.0
+            lm_step_time_since_report = 0.0
+            decode_time_since_report = 0.0
             last_report = time.time()
-            # Content-level tracking: the mechanical pipeline can be perfectly healthy while the
-            # model itself has gone "mute" (generating only PAD text tokens and silent audio,
-            # forever). Track when the model last said anything and how loud its output is so the
-            # perf log distinguishes "pipeline broken" from "model went silent".
             last_text_time = time.time()
             text_tokens_since_report = 0
+            pad_tokens_since_report = 0
+            epad_tokens_since_report = 0
             out_sq_sum = 0.0
             out_sample_cnt = 0
+            out_peak_since_report = 0.0
             recovery_count = 0
+
+            # --- forensic instrumentation state (see _diag_* helpers on ServerState) ---
+            capacity = self.lm_gen.lm_model.context
+            session_conv_start = time.time()
+            prev_wrap_count = 0
+            prev_milestone = 0
+            capacity_reached_logged = False
+            capacity_exceeded_logged = False
+            silence_event_fired = False
+            frame_number = 0
+            silent_frame_count = 0
+            consecutive_silent_frames = 0
+            SILENCE_RMS_THRESHOLD = 0.001
+            prob_sampled_sum = 0.0
+            prob_pad_sum = 0.0
+            prob_count = 0
+            # Time-based snapshot schedule: (elapsed_seconds, label). Popped in order as
+            # `session_conv_start`-relative elapsed time crosses each threshold.
+            pending_snapshots = [
+                (120, "t120s"), (180, "t180s"), (240, "t240s"), (300, "t300s"),
+                (330, "t330s"), (345, "t345s"), (360, "t360s"),
+            ]
 
             while True:
                 if close:
                     return
                 await asyncio.sleep(0.001)
+
+                now0 = time.time()
+                elapsed = now0 - session_conv_start
+                while pending_snapshots and elapsed >= pending_snapshots[0][0]:
+                    _, label = pending_snapshots.pop(0)
+                    self._diag_snapshot(diag_conn_id, label, elapsed)
+                    clog.log("info", f"DIAG snapshot '{label}' taken at {elapsed:.1f}s elapsed")
 
                 if self.mute_recovery_secs > 0 and (time.time() - last_text_time) > self.mute_recovery_secs:
                     # The model has not produced a single word in `mute_recovery_secs`. In our
@@ -321,6 +495,9 @@ class ServerState:
                     recovery_count += 1
                     reprime_start = time.time()
                     self._mark_progress("opus_loop: mute recovery (instant persona restore)")
+                    self._diag_event(diag_conn_id, clog, "recovery_triggered",
+                                      recovery_count=recovery_count, elapsed_s=round(elapsed, 1),
+                                      offset=self.lm_gen._streaming_state.offset)
                     self._restore_lm_gen_state(persona_snapshot)
                     # The just-restored state predates anything the user said since connecting, so
                     # audio queued up under the old (dead) state must be dropped -- feeding it into
@@ -340,85 +517,268 @@ class ServerState:
                 pcm = opus_reader.read_pcm()
                 if pcm.shape[-1] == 0:
                     continue
+                diag_state["pcm_frames_received"] += pcm.shape[-1]
                 if all_pcm_data is None:
                     all_pcm_data = pcm
                 else:
                     all_pcm_data = np.concatenate((all_pcm_data, pcm))
                 while all_pcm_data.shape[-1] >= self.frame_size:
-                    be = time.time()
-                    self._mark_progress("opus_loop: slicing/transfer chunk")
-                    chunk = all_pcm_data[: self.frame_size]
-                    all_pcm_data = all_pcm_data[self.frame_size:]
-                    chunk = torch.from_numpy(chunk)
-                    chunk = chunk.to(device=self.device)[None, None]
-                    self._mark_progress("opus_loop: mimi.encode")
-                    codes = self.mimi.encode(chunk)
-                    self._mark_progress("opus_loop: other_mimi.encode")
-                    _ = self.other_mimi.encode(chunk)
-                    for c in range(codes.shape[-1]):
-                        self._mark_progress(f"opus_loop: lm_gen.step (c={c}/{codes.shape[-1]}, offset={self.lm_gen._streaming_state.offset})")
-                        tokens = self.lm_gen.step(codes[:, :, c: c + 1])
-                        if tokens is None:
-                            continue
-                        assert tokens.shape[1] == self.lm_gen.lm_model.dep_q + 1
-                        self._mark_progress("opus_loop: mimi.decode")
-                        main_pcm = self.mimi.decode(tokens[:, 1:9])
-                        self._mark_progress("opus_loop: other_mimi.decode")
-                        _ = self.other_mimi.decode(tokens[:, 1:9])
-                        self._mark_progress("opus_loop: main_pcm.cpu()")
-                        main_pcm = main_pcm.cpu()
-                        self._mark_progress("opus_loop: opus_writer.append_pcm")
-                        pcm_out = main_pcm[0, 0].numpy()
-                        opus_writer.append_pcm(pcm_out)
-                        out_sq_sum += float(np.square(pcm_out).sum())
-                        out_sample_cnt += pcm_out.shape[-1]
-                        text_token = tokens[0, 0, 0].item()
-                        if text_token not in (0, 3):
-                            text_tokens_since_report += 1
-                            last_text_time = time.time()
-                            _text = self.text_tokenizer.id_to_piece(text_token)  # type: ignore
-                            _text = _text.replace("▁", " ")
-                            msg = b"\x02" + bytes(_text, encoding="utf8")
-                            self._mark_progress("opus_loop: ws.send_bytes (text)")
-                            await ws.send_bytes(msg)
-                        else:
-                            text_token_map = ['EPAD', 'BOS', 'EOS', 'PAD']
+                    try:
+                        be = time.time()
+                        frame_number += 1
+                        self._mark_progress("opus_loop: slicing/transfer chunk")
+                        chunk = all_pcm_data[: self.frame_size]
+                        all_pcm_data = all_pcm_data[self.frame_size:]
+                        chunk = torch.from_numpy(chunk)
+                        chunk = chunk.to(device=self.device)[None, None]
 
-                    processing_time_since_report += time.time() - be
-                    frames_since_report += 1
-                    self._mark_progress("opus_loop: between frames")
+                        t_enc = time.time()
+                        self._mark_progress("opus_loop: mimi.encode")
+                        codes = self.mimi.encode(chunk)
+                        self._mark_progress("opus_loop: other_mimi.encode")
+                        _ = self.other_mimi.encode(chunk)
+                        encode_time_since_report += time.time() - t_enc
+                        diag_state["mimi_encode_calls"] += 1
+                        diag_state["encoded_code_frames"] += codes.shape[-1]
+
+                        for c in range(codes.shape[-1]):
+                            current_offset = self.lm_gen._streaming_state.offset
+                            self._mark_progress(
+                                f"opus_loop: lm_gen.step (c={c}/{codes.shape[-1]}, offset={current_offset})"
+                            )
+
+                            # --- cheap, per-step, sync-free offset/wrap tracking ---
+                            # `current_offset` is a plain Python int already materialized by
+                            # LMGen (no GPU read needed here). Every main-transformer layer's
+                            # own RingKVCache advances in lockstep with it (each is fed exactly
+                            # one token per step()), so wrap/position arithmetic on this single
+                            # counter is equivalent to reading the real cache, without the sync
+                            # cost of calling `.stats()` (which does) on every step.
+                            wrap_count = current_offset // capacity
+                            if wrap_count != prev_wrap_count:
+                                self._diag_event(diag_conn_id, clog, "ring_cache_wrap",
+                                                  wrap_count=wrap_count, offset=current_offset,
+                                                  elapsed_s=round(elapsed, 1))
+                                prev_wrap_count = wrap_count
+                            milestone = current_offset // 250
+                            if milestone != prev_milestone:
+                                self._diag_event(diag_conn_id, clog, "offset_milestone",
+                                                  offset=current_offset, milestone=milestone * 250,
+                                                  elapsed_s=round(elapsed, 1))
+                                prev_milestone = milestone
+                            if current_offset == capacity and not capacity_reached_logged:
+                                capacity_reached_logged = True
+                                self._diag_event(diag_conn_id, clog, "offset_reached_capacity",
+                                                  offset=current_offset, capacity=capacity,
+                                                  elapsed_s=round(elapsed, 1))
+                            if current_offset > capacity and not capacity_exceeded_logged:
+                                capacity_exceeded_logged = True
+                                self._diag_event(diag_conn_id, clog, "offset_exceeded_capacity",
+                                                  offset=current_offset, capacity=capacity,
+                                                  elapsed_s=round(elapsed, 1))
+
+                            t_lm = time.time()
+                            if self.diag_probs:
+                                tokens, logits_pack = self.lm_gen.step(codes[:, :, c: c + 1])
+                                text_logits = logits_pack[0] if logits_pack is not None else None
+                            else:
+                                tokens = self.lm_gen.step(codes[:, :, c: c + 1])
+                                text_logits = None
+                            lm_step_time_since_report += time.time() - t_lm
+                            if tokens is None:
+                                continue
+                            assert tokens.shape[1] == self.lm_gen.lm_model.dep_q + 1
+
+                            t_dec = time.time()
+                            self._mark_progress("opus_loop: mimi.decode")
+                            main_pcm = self.mimi.decode(tokens[:, 1:9])
+                            self._mark_progress("opus_loop: other_mimi.decode")
+                            _ = self.other_mimi.decode(tokens[:, 1:9])
+                            decode_time_since_report += time.time() - t_dec
+                            diag_state["pcm_frames_decoded"] += 1
+
+                            self._mark_progress("opus_loop: main_pcm.cpu()")
+                            main_pcm = main_pcm.cpu()
+                            self._mark_progress("opus_loop: opus_writer.append_pcm")
+                            pcm_out = main_pcm[0, 0].numpy()
+                            opus_writer.append_pcm(pcm_out)
+                            frame_rms = float(np.sqrt(np.mean(np.square(pcm_out))))
+                            frame_peak = float(np.abs(pcm_out).max()) if pcm_out.size else 0.0
+                            out_sq_sum += float(np.square(pcm_out).sum())
+                            out_sample_cnt += pcm_out.shape[-1]
+                            out_peak_since_report = max(out_peak_since_report, frame_peak)
+                            if frame_rms < SILENCE_RMS_THRESHOLD:
+                                silent_frame_count += 1
+                                consecutive_silent_frames += 1
+                                if consecutive_silent_frames == 1:
+                                    self._diag_event(diag_conn_id, clog, "output_rms_near_zero",
+                                                      frame_rms=round(frame_rms, 6), frame_number=frame_number,
+                                                      elapsed_s=round(elapsed, 1))
+                            else:
+                                consecutive_silent_frames = 0
+
+                            text_token = tokens[0, 0, 0].item()
+                            if text_logits is not None:
+                                # Divide by temp_text before softmax to match the actual
+                                # distribution `sample_token()` samples from internally
+                                # (see moshi/moshi/utils/sampling.py) -- otherwise these
+                                # numbers would be a different (temp=1) distribution than
+                                # the one that actually produced the sampled token.
+                                probs = torch.softmax(text_logits.float() / self.lm_gen.temp_text, dim=-1)
+                                prob_sampled_sum += float(probs[0, 0, 0, text_token].item())
+                                prob_pad_sum += float(probs[0, 0, 0, self.lm_gen.zero_text_code].item())
+                                prob_count += 1
+                            if text_token == 0:
+                                epad_tokens_since_report += 1
+                            elif text_token == self.lm_gen.zero_text_code:  # 3 == PAD
+                                pad_tokens_since_report += 1
+                            else:
+                                text_tokens_since_report += 1
+                                last_text_time = time.time()
+                                silence_event_fired = False
+                                _text = self.text_tokenizer.id_to_piece(text_token)  # type: ignore
+                                _text = _text.replace("▁", " ")
+                                msg = b"\x02" + bytes(_text, encoding="utf8")
+                                self._mark_progress("opus_loop: ws.send_bytes (text)")
+                                await ws.send_bytes(msg)
+                                diag_state["bytes_sent_text"] += len(msg)
+                                diag_state["ws_last_send_time"] = time.time()
+
+                            if not silence_event_fired and (time.time() - last_text_time) > 5.0:
+                                silence_event_fired = True
+                                silence_elapsed = time.time() - session_conv_start
+                                self._diag_event(diag_conn_id, clog, "silence_onset",
+                                                  elapsed_s=round(silence_elapsed, 1),
+                                                  offset=current_offset)
+                                silence_snap = self._diag_snapshot(
+                                    diag_conn_id, "silence_onset", silence_elapsed,
+                                )
+                                diffs = self._diag_diff(
+                                    session_start_snapshot.get("lm_gen", {}),
+                                    silence_snap.get("lm_gen", {}),
+                                )
+                                clog.log(
+                                    "warning",
+                                    f"DIAG: {len(diffs)} field(s) changed between session_start and "
+                                    f"silence_onset lm_gen snapshots (see {self._diag_path} for full detail)",
+                                )
+                                self._diag_write({
+                                    "record_type": "auto_diff",
+                                    "conn_id": diag_conn_id,
+                                    "compared": ["session_start", "silence_onset"],
+                                    "diff_count": len(diffs),
+                                    "diffs": [{"path": p, "before": a, "after": b} for p, a, b in diffs],
+                                })
+                                pending_snapshots.append(
+                                    (silence_elapsed + 30, "silence_plus_30s")
+                                )
+                                pending_snapshots.sort()
+
+                        processing_time_since_report += time.time() - be
+                        frames_since_report += 1
+                        self._mark_progress("opus_loop: between frames")
+                    except Exception as exc:
+                        self._diag_event(diag_conn_id, clog, "exception", where="opus_loop",
+                                          exception=repr(exc), traceback=traceback.format_exc())
+                        raise
 
                 now = time.time()
-                if now - last_report >= 5.0:
+                if self.diag_interval_secs > 0 and now - last_report >= self.diag_interval_secs:
                     backlog_s = (0 if all_pcm_data is None else all_pcm_data.shape[-1]) / self.mimi.sample_rate
                     budget_s = frames_since_report * frame_wall_time
                     rtf = (processing_time_since_report / budget_s) if budget_s > 0 else 0.0
                     out_rms = (out_sq_sum / out_sample_cnt) ** 0.5 if out_sample_cnt > 0 else 0.0
+                    current_offset = self.lm_gen._streaming_state.offset
                     clog.log(
                         "info" if rtf < 0.9 else "warning",
                         f"perf: {frames_since_report} frames in last {now - last_report:.1f}s, "
                         f"processing/real-time ratio={rtf:.2f}, unprocessed input backlog={backlog_s:.2f}s, "
                         f"text_tokens={text_tokens_since_report}, out_rms={out_rms:.4f}, "
                         f"last_text={now - last_text_time:.0f}s ago, "
-                        f"offset={self.lm_gen._streaming_state.offset}/{self.lm_gen.lm_model.context}",
+                        f"offset={current_offset}/{capacity}",
                     )
+                    diag_record = {
+                        "record_type": "periodic",
+                        "conn_id": diag_conn_id,
+                        "time": {
+                            "elapsed_session_s": round(now - session_conv_start, 2),
+                            "frame_number": frame_number,
+                            "model_step_count": current_offset,
+                            "state_offset": current_offset,
+                            "ring_wrap_count": current_offset // capacity,
+                            "modulo_index": current_offset % capacity,
+                            "context_capacity": capacity,
+                            "pct_context_consumed": round(100.0 * current_offset / capacity, 2),
+                        },
+                        "lm_state": {
+                            "lm_gen_offset": current_offset,
+                            "streaming_state_summary": self.lm_gen.diagnostic_snapshot(per_layer=False),
+                            "text_tokens_count": text_tokens_since_report,
+                            "pad_tokens_count": pad_tokens_since_report,
+                            "epad_tokens_count": epad_tokens_since_report,
+                            "avg_prob_sampled_token": (prob_sampled_sum / prob_count) if prob_count else None,
+                            "avg_prob_pad": (prob_pad_sum / prob_count) if prob_count else None,
+                            "diag_probs_enabled": self.diag_probs,
+                        },
+                        "audio_pipeline": {
+                            "pcm_frames_received_total": diag_state["pcm_frames_received"],
+                            "mimi_encode_calls_total": diag_state["mimi_encode_calls"],
+                            "encoded_code_frames_total": diag_state["encoded_code_frames"],
+                            "mic_queue_backlog_s": round(backlog_s, 3),
+                            "pcm_frames_decoded_total": diag_state["pcm_frames_decoded"],
+                            "output_rms": round(out_rms, 6),
+                            "output_peak": round(out_peak_since_report, 6),
+                            "silent_frame_count_total": silent_frame_count,
+                            "consecutive_silent_frames": consecutive_silent_frames,
+                        },
+                        "connection": {
+                            "ws_closed": ws.closed,
+                            "seconds_since_last_recv": round(now - diag_state["ws_last_recv_time"], 2),
+                            "seconds_since_last_send": round(now - diag_state["ws_last_send_time"], 2),
+                            "asyncio_tasks": self._diag_task_summary(),
+                        },
+                        "performance": {
+                            **self._diag_gpu_cpu_stats(),
+                            "mimi_encode_time_s": round(encode_time_since_report, 4),
+                            "lm_step_time_s": round(lm_step_time_since_report, 4),
+                            "mimi_decode_time_s": round(decode_time_since_report, 4),
+                            "processing_real_time_ratio": round(rtf, 3),
+                        },
+                    }
+                    self._diag_write(diag_record)
                     last_report = now
                     frames_since_report = 0
                     processing_time_since_report = 0.0
+                    encode_time_since_report = 0.0
+                    lm_step_time_since_report = 0.0
+                    decode_time_since_report = 0.0
                     text_tokens_since_report = 0
+                    pad_tokens_since_report = 0
+                    epad_tokens_since_report = 0
                     out_sq_sum = 0.0
                     out_sample_cnt = 0
+                    out_peak_since_report = 0.0
+                    prob_sampled_sum = 0.0
+                    prob_pad_sum = 0.0
+                    prob_count = 0
 
         async def send_loop():
-            while True:
-                if close:
-                    return
-                await asyncio.sleep(0.001)
-                self._mark_progress("send_loop: opus_writer.read_bytes")
-                msg = opus_writer.read_bytes()
-                if len(msg) > 0:
-                    self._mark_progress("send_loop: ws.send_bytes (audio)")
-                    await ws.send_bytes(b"\x01" + msg)
+            try:
+                while True:
+                    if close:
+                        return
+                    await asyncio.sleep(0.001)
+                    self._mark_progress("send_loop: opus_writer.read_bytes")
+                    msg = opus_writer.read_bytes()
+                    if len(msg) > 0:
+                        self._mark_progress("send_loop: ws.send_bytes (audio)")
+                        await ws.send_bytes(b"\x01" + msg)
+                        diag_state["bytes_sent_audio"] += len(msg)
+                        diag_state["ws_last_send_time"] = time.time()
+            except Exception as exc:
+                self._diag_event(diag_conn_id, clog, "exception", where="send_loop",
+                                  exception=repr(exc), traceback=traceback.format_exc())
+                raise
 
         clog.log("info", "accepted connection")
         if len(request.query["text_prompt"]) > 0:
@@ -456,15 +816,19 @@ class ServerState:
             # Snapshot right after priming so mid-conversation mute recovery (see opus_loop) can
             # jump back here almost instantly instead of replaying the whole prompt.
             persona_snapshot = self._snapshot_lm_gen_state()
+            # Full forensic snapshot at the same point, used as the "known good" baseline that
+            # the silence-onset snapshot (taken inside opus_loop) gets automatically diffed
+            # against the moment the model goes quiet.
+            session_start_snapshot = self._diag_snapshot(diag_conn_id, "session_start", elapsed=0.0)
             # Send the handshake.
             if await is_alive():
                 await ws.send_bytes(b"\x00")
                 clog.log("info", "sent handshake bytes")
                 # Clean cancellation manager
                 tasks = [
-                    asyncio.create_task(recv_loop()),
-                    asyncio.create_task(opus_loop()),
-                    asyncio.create_task(send_loop()),
+                    asyncio.create_task(recv_loop(), name="recv_loop"),
+                    asyncio.create_task(opus_loop(), name="opus_loop"),
+                    asyncio.create_task(send_loop(), name="send_loop"),
                 ]
 
                 done, pending = await asyncio.wait(tasks, return_when=asyncio.FIRST_COMPLETED)
@@ -475,6 +839,8 @@ class ServerState:
                     exc = task.exception()
                     if exc is not None:
                         clog.log("error", f"session task {task.get_name()} failed: {exc!r}")
+                    self._diag_event(diag_conn_id, clog, "task_exit", task=task.get_name(),
+                                      exception=repr(exc) if exc is not None else None)
                 # Force-kill remaining tasks
                 for task in pending:
                     task.cancel()
@@ -593,7 +959,24 @@ def main():
                              "mid-conversation (the 'goes permanently silent after a few minutes' "
                              "failure mode), automatically reset and replay the voice/text prompts "
                              "inside the same connection so the conversation can continue. "
-                             "0 disables recovery (default).")
+                             "0 disables recovery (default). For a clean evidence-gathering run of "
+                             "the silence issue itself, leave this at 0 so the natural failure "
+                             "isn't auto-recovered away before its full signature is captured.")
+    parser.add_argument("--diag-interval-secs", type=float, default=5.0,
+                        help="Interval, in seconds, for the structured forensic diagnostic log "
+                             "(JSONL, one line per interval covering timing, LM state, KV-cache "
+                             "position, audio pipeline, connection, and performance). 0 disables "
+                             "periodic diagnostic logging (event/snapshot logging still runs). "
+                             "Default 5.0s.")
+    parser.add_argument("--diag-probs", action="store_true",
+                        help="Also capture the sampling probability assigned to the sampled text "
+                             "token and to the PAD token, every step. Requires computing an extra "
+                             "softmax and cloning logits every step (small but real per-step "
+                             "overhead) -- off by default, turn on for one detailed diagnostic run.")
+    parser.add_argument("--diag-dir", type=str, default=".",
+                        help="Directory for diagnostic output: personaplex_diag.jsonl (structured "
+                             "periodic/event/snapshot-pointer log) plus one snapshot_<conn>_<label>.json "
+                             "file per snapshot. Defaults to the current directory.")
     parser.add_argument(
         "--voice-prompt-dir",
         type=str,
@@ -675,7 +1058,11 @@ def main():
         voice_prompt_dir=args.voice_prompt_dir,
         save_voice_prompt_embeddings=False,
         mute_recovery_secs=args.mute_recovery_secs,
+        diag_interval_secs=args.diag_interval_secs,
+        diag_probs=args.diag_probs,
+        diag_dir=args.diag_dir,
     )
+    logger.info(f"diagnostic log: {state._diag_path}")
     logger.info("warming up the model")
     state.warmup()
     threading.Thread(target=state._watchdog_loop, daemon=True, name="hang-watchdog").start()

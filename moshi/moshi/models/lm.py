@@ -1126,6 +1126,60 @@ class LMGen(StreamingModule[_LMGenState]):
         self._step_text_prompt()
         self._step_audio_silence()
 
+    def diagnostic_snapshot(self, per_layer: bool = False) -> dict:
+        """Tensor-free summary of this LMGen's entire streaming state, for forensic
+        logging (see server.py's diagnostic instrumentation). Never returns tensor
+        contents -- only shapes, offsets, and cache-position metadata.
+
+        `per_layer=False` (used for the frequent periodic log) reports layer 0's
+        RingKVCache only: every main-transformer layer's cache advances in lockstep
+        (each one is fed exactly one token per `step()` call), so layer 0 is
+        representative and reading only its `.stats()` avoids 32 GPU syncs per call.
+        `per_layer=True` (used for one-off snapshots, which are infrequent) reports
+        every layer individually, so a real divergence between layers -- which would
+        itself be a very interesting finding -- can't hide behind that assumption.
+        """
+        state = self._streaming_state
+        out: dict = {"has_streaming_state": state is not None}
+        if state is None:
+            return out
+        out["lm_gen_offset"] = state.offset
+        out["cache_shape"] = list(state.cache.shape)
+        out["provided_true_count"] = int(state.provided.sum().item())
+        out["max_delay"] = self.max_delay
+
+        layers = self.lm_model.transformer.layers
+        out["num_main_layers"] = len(layers)
+        if per_layer:
+            layer_stats = []
+            for i, layer in enumerate(layers):
+                attn_state = layer.self_attn._streaming_state
+                entry = {"layer": i}
+                if attn_state is None:
+                    entry["streaming"] = False
+                else:
+                    entry["offset_cpu"] = attn_state.offset_cpu
+                    entry.update(attn_state.kv_cache.stats())
+                layer_stats.append(entry)
+            out["main_transformer_layers"] = layer_stats
+        else:
+            attn_state = layers[0].self_attn._streaming_state
+            out["main_transformer_layer0"] = (
+                {"streaming": False} if attn_state is None
+                else {"offset_cpu": attn_state.offset_cpu, **attn_state.kv_cache.stats()}
+            )
+
+        # The depformer's own streaming state is intentionally NOT reported here: it is
+        # reset via `with lm_model.depformer.streaming(B):` at the start and end of every
+        # single `depformer_step()` call (see that method below), so by the time any code
+        # outside of that `with` block can observe it, it has already been torn down --
+        # there is nothing persistent to snapshot. Its fixed configuration is reported
+        # instead, since that's the only part of it that's meaningful between calls.
+        out["depformer_state_is_ephemeral"] = True
+        out["depformer_capacity_per_call"] = self.lm_model.dep_q
+
+        return out
+
     def depformer_step(
         self,
         text_token: torch.Tensor,
