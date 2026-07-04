@@ -50,6 +50,7 @@ import random
 
 from .client_utils import make_log, colorize
 from .models import loaders, MimiModel, LMModel, LMGen
+from .modules.streaming import _flatten_streaming_state
 from .utils.connection import create_ssl_context, get_lan_ip
 from .utils.logging import setup_logger, ColorizedLog
 
@@ -138,6 +139,30 @@ class ServerState:
         self.watchdog_label = label
         self.watchdog_ts = time.time()
         self._watchdog_reported = False
+
+    def _snapshot_lm_gen_state(self) -> dict:
+        """Deep-clone `self.lm_gen`'s entire streaming state (every attention layer's rotating
+        KV-cache plus LMGen's own token cache/offset) into plain tensors, right after the voice +
+        text prompt have just finished loading. Used by mute recovery to jump straight back to
+        "persona just loaded" without re-running ~1000+ full model steps one token at a time.
+        """
+        tensors: dict = {}
+        metadata: dict = {}
+        _flatten_streaming_state(tensors, metadata, self.lm_gen.get_streaming_state(), prefix="")
+        snapshot = {k: v.clone() for k, v in tensors.items()}
+        snapshot.update(metadata)
+        return snapshot
+
+    def _restore_lm_gen_state(self, snapshot: dict) -> None:
+        """Copy a snapshot from `_snapshot_lm_gen_state` back into the live model state, in place.
+
+        This must copy *values* into the existing tensors (via `set_streaming_state_inplace`,
+        which uses `.copy_()`) rather than swap in new tensor objects: `state.graphed_main` /
+        `state.graphed_depth` are CUDA-graph-captured, and a CUDA graph replay always reads and
+        writes the exact memory addresses it was captured with. Replacing the tensor objects
+        instead of their contents would silently desync the graph from the "restored" state.
+        """
+        self.lm_gen.set_streaming_state_inplace(dict(snapshot))
 
     def _watchdog_loop(self, timeout: float = 8.0, poll_interval: float = 2.0):
         while True:
@@ -287,51 +312,28 @@ class ServerState:
                     # observed failure mode this state is permanent (the persona/system prompt has
                     # rotated out of the model's fixed 3000-step attention window and generation
                     # degenerates into endless PAD tokens), so rather than stay silent forever we
-                    # re-prime the persona *inside the same connection*: reset the streaming
-                    # states and replay the voice + text prompts, exactly like connection setup.
+                    # jump the model's entire streaming state (every attention layer's KV-cache,
+                    # LMGen's own token cache/offset) back to the snapshot taken right after the
+                    # voice+text prompt finished loading at connection time. This is a handful of
+                    # in-place tensor copies, not ~1000+ replayed forward passes, so it takes
+                    # milliseconds instead of tens of seconds -- no audio backlog builds up and no
+                    # mic input is dropped while it happens.
                     recovery_count += 1
-                    clog.log(
-                        "warning",
-                        f"model produced no text for {time.time() - last_text_time:.0f}s -- "
-                        f"re-priming persona in-session (recovery #{recovery_count}, "
-                        f"takes roughly as long as the initial connect pause)",
-                    )
                     reprime_start = time.time()
-                    last_keepalive = 0.0
-
-                    async def alive_midsession():
-                        # Unlike the connection-setup `is_alive`, this must NOT call ws.receive()
-                        # (recv_loop is running concurrently and aiohttp forbids two concurrent
-                        # receives). It yields to the event loop so recv_loop/send_loop/heartbeat
-                        # keep running, and sends an in-band ping (0x06, understood and ignored by
-                        # the web client) every few seconds so the client's inactivity watchdog
-                        # doesn't kill the connection during this deliberately-quiet stretch.
-                        nonlocal last_keepalive
-                        if close or ws.closed:
-                            return False
-                        # Refresh the hang watchdog too: a long re-prime is deliberate work,
-                        # not a stall, and shouldn't trigger stack dumps.
-                        self._mark_progress("opus_loop: mute recovery (re-priming persona)")
-                        await asyncio.sleep(0.001)
-                        if time.time() - last_keepalive > 5.0:
-                            last_keepalive = time.time()
-                            await ws.send_bytes(b"\x06")
-                        return True
-
-                    self._mark_progress("opus_loop: mute recovery (re-priming persona)")
-                    self.mimi.reset_streaming()
-                    self.other_mimi.reset_streaming()
-                    self.lm_gen.reset_streaming()
-                    await self.lm_gen.step_system_prompts_async(self.mimi, is_alive=alive_midsession)
-                    self.mimi.reset_streaming()
-                    # Drop mic audio that piled up while the model was being re-primed (it was
-                    # "deaf" during that window; feeding it stale audio would only confuse it).
+                    self._mark_progress("opus_loop: mute recovery (instant persona restore)")
+                    self._restore_lm_gen_state(persona_snapshot)
+                    # The just-restored state predates anything the user said since connecting, so
+                    # audio queued up under the old (dead) state must be dropped -- feeding it into
+                    # the freshly-restored state would splice unrelated context together.
                     _ = opus_reader.read_pcm()
                     all_pcm_data = None
                     last_text_time = time.time()
                     clog.log(
                         "warning",
-                        f"persona re-primed in {time.time() - reprime_start:.1f}s; conversation resumes",
+                        f"model was silent for >{self.mute_recovery_secs:.0f}s -- restored persona "
+                        f"in {time.time() - reprime_start:.3f}s (recovery #{recovery_count}). "
+                        f"Note: this restores the persona, not the conversation since then -- the "
+                        f"model's fixed attention window cannot hold both.",
                     )
                     continue
 
@@ -450,6 +452,9 @@ class ServerState:
             await self.lm_gen.step_system_prompts_async(self.mimi, is_alive=is_alive)
             self.mimi.reset_streaming()
             clog.log("info", "done with system prompts")
+            # Snapshot right after priming so mid-conversation mute recovery (see opus_loop) can
+            # jump back here almost instantly instead of replaying the whole prompt.
+            persona_snapshot = self._snapshot_lm_gen_state()
             # Send the handshake.
             if await is_alive():
                 await ws.send_bytes(b"\x00")
