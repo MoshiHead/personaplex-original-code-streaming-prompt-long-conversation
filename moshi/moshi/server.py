@@ -399,7 +399,8 @@ class ServerState:
                         f"perf: {frames_since_report} frames in last {now - last_report:.1f}s, "
                         f"processing/real-time ratio={rtf:.2f}, unprocessed input backlog={backlog_s:.2f}s, "
                         f"text_tokens={text_tokens_since_report}, out_rms={out_rms:.4f}, "
-                        f"last_text={now - last_text_time:.0f}s ago",
+                        f"last_text={now - last_text_time:.0f}s ago, "
+                        f"offset={self.lm_gen._streaming_state.offset}/{self.lm_gen.lm_model.context}",
                     )
                     last_report = now
                     frames_since_report = 0
