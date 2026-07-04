@@ -30,10 +30,12 @@ from dataclasses import dataclass
 import random
 import os
 from pathlib import Path
+import signal
 import tarfile
 import time
 import secrets
 import sys
+import traceback
 from typing import Literal, Optional
 
 import aiohttp
@@ -212,6 +214,16 @@ class ServerState:
 
         async def opus_loop():
             all_pcm_data = None
+            # Real-time-factor tracking: each `frame_size` chunk represents a fixed slice of
+            # wall-clock audio time. If processing one chunk takes longer than that, we are
+            # falling behind real time and the backlog in `all_pcm_data` will only ever grow --
+            # from the client's perspective this looks exactly like a "frozen" conversation
+            # (the connection stays open and audio keeps trickling out, just increasingly late)
+            # even though the GPU is still busy grinding through a queue of stale input.
+            frame_wall_time = self.frame_size / self.mimi.sample_rate
+            frames_since_report = 0
+            processing_time_since_report = 0.0
+            last_report = time.time()
 
             while True:
                 if close:
@@ -249,6 +261,23 @@ class ServerState:
                             await ws.send_bytes(msg)
                         else:
                             text_token_map = ['EPAD', 'BOS', 'EOS', 'PAD']
+
+                    processing_time_since_report += time.time() - be
+                    frames_since_report += 1
+
+                now = time.time()
+                if now - last_report >= 5.0:
+                    backlog_s = (0 if all_pcm_data is None else all_pcm_data.shape[-1]) / self.mimi.sample_rate
+                    budget_s = frames_since_report * frame_wall_time
+                    rtf = (processing_time_since_report / budget_s) if budget_s > 0 else 0.0
+                    clog.log(
+                        "info" if rtf < 0.9 else "warning",
+                        f"perf: {frames_since_report} frames in last {now - last_report:.1f}s, "
+                        f"processing/real-time ratio={rtf:.2f}, unprocessed input backlog={backlog_s:.2f}s",
+                    )
+                    last_report = now
+                    frames_since_report = 0
+                    processing_time_since_report = 0.0
 
         async def send_loop():
             while True:
@@ -354,6 +383,38 @@ def _get_voice_prompt_dir(voice_prompt_dir: Optional[str], hf_repo: str) -> Opti
     return str(voices_dir)
 
 
+def _dump_stacks(signum, frame):
+    """SIGUSR1 handler: print every asyncio task's current stack plus every Python thread's
+    stack, without killing the process. Useful in containers (like some RunPod images) that
+    deny the ptrace permission py-spy needs (`Permission denied (os error 13)`).
+
+    Usage: `kill -USR1 <server_pid>`, then check the server's stdout/log file.
+
+    Caveat: like any pure-Python signal handler, this only runs once control returns to the
+    interpreter between bytecode instructions -- if the process is stuck inside a single
+    long-running C/CUDA call holding the GIL, the dump won't print until that call returns.
+    """
+    lines = ["", "=" * 20 + " STACK DUMP (SIGUSR1) " + "=" * 20]
+    try:
+        tasks = asyncio.all_tasks()
+    except RuntimeError:
+        tasks = []
+        lines.append("no running asyncio event loop found in this thread")
+    for task in tasks:
+        lines.append(f"--- asyncio task {task.get_name()} ---")
+        stack = task.get_stack()
+        if not stack:
+            lines.append("  (no Python stack available -- likely awaiting a Future/executor)")
+        else:
+            lines.extend("  " + line for line in "".join(traceback.format_stack(stack[-1])).splitlines())
+    lines.append("--- all Python threads (sys._current_frames) ---")
+    for thread_id, thread_frame in sys._current_frames().items():
+        lines.append(f"thread {thread_id}:")
+        lines.extend("  " + line for line in "".join(traceback.format_stack(thread_frame)).splitlines())
+    lines.append("=" * 60)
+    print("\n".join(lines), file=sys.stderr, flush=True)
+
+
 def _get_static_path(static: Optional[str]) -> Optional[str]:
     if static is None:
         logger.info("retrieving the static content")
@@ -371,6 +432,8 @@ def _get_static_path(static: Optional[str]) -> Optional[str]:
 
 
 def main():
+    if hasattr(signal, "SIGUSR1"):  # not available on Windows
+        signal.signal(signal.SIGUSR1, _dump_stacks)
     parser = argparse.ArgumentParser()
     parser.add_argument("--host", default="localhost", type=str)
     parser.add_argument("--port", default=8998, type=int)
