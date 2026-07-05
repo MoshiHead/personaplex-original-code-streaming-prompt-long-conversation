@@ -44,6 +44,34 @@ from .gating import make_gating
 from .rope import RotaryEmbedding
 from .streaming import StreamingModule, StreamingContainer
 
+# --- Diagnostic instrumentation (mechanism investigation: why generation collapses
+# around offset = 2 x context capacity) ---------------------------------------------
+# When True, StreamingMultiheadAttention.forward computes attention manually (bypassing
+# the fused, weight-opaque F.scaled_dot_product_attention) and appends a per-call summary
+# (NOT the full [H, T, capacity] matrix -- that would be enormous accumulated over 32
+# layers x thousands of steps) to DIAG_ATTENTION_LOG: how concentrated the attention is
+# (max weight, entropy) and how many keys are actually valid under the causal+context mask.
+#
+# This ONLY takes effect for calls that actually execute this Python branch. The main
+# transformer's forward is normally CUDA-graph-captured (see LMGen's `graphed_main` in
+# lm.py): the graph is captured ONCE during server warmup with whatever this flag's value
+# was at that moment, and REPLAYS that exact captured kernel sequence forever after --
+# flipping this flag afterward has no effect on already-graphed layers. To actually observe
+# attention weights for the main transformer, run the server with the NO_CUDA_GRAPH=1
+# environment variable set (see moshi/moshi/utils/compile.py: _is_cuda_graph_enabled),
+# accepting reduced throughput for the ability to introspect every layer's live computation.
+DIAG_CAPTURE_ATTENTION = False
+DIAG_ATTENTION_LOG: list = []
+
+# --- Experiment toggles (server.py --experiment {A..F}) -----------------------------
+# Both default to ORIGINAL, unmodified behavior. Only non-default when a specific
+# lettered experiment is selected, for A/B comparison against the baseline. Because the
+# main transformer's forward is CUDA-graph-captured once at server warmup, these MUST be
+# set (via CLI, in main()) before that capture happens -- flipping them mid-session has
+# no effect on an already-captured graph.
+EXPERIMENT_FIX_BOUNDARY_OFFBYONE = False  # Experiment B: see RingKVCache.complete()
+EXPERIMENT_ROPE_REBASE_CONTEXT: tp.Optional[int] = None  # Experiment C: set to context length
+
 
 class LayerNormF32(nn.LayerNorm):
     def forward(self, input: torch.Tensor) -> torch.Tensor:
@@ -260,20 +288,23 @@ class RingKVCache:
     def reset(self):
         self.end_offset.zero_()
 
-    def stats(self) -> dict:
+    def stats(self, deep: bool = False) -> dict:
         """Cheap, tensor-free snapshot of this cache's position -- for diagnostic logging
         only (see server.py's --diag-interval-secs instrumentation). Never returns the
-        actual key/value tensors, only shapes/positions/counters. Calling this does one
-        `.item()` sync (reads `end_offset` off the GPU) -- call it at a reporting interval
-        or snapshot point, never per model step (that would add a GPU sync 12.5x/sec per
-        layer, which is exactly the overhead this instrumentation is designed to avoid).
+        actual key/value tensors, only shapes/positions/counters/norms. Calling this does
+        one `.item()` sync (reads `end_offset` off the GPU) -- call it at a reporting
+        interval or snapshot point, never per model step (that would add a GPU sync
+        12.5x/sec per layer, which is exactly the overhead this instrumentation is
+        designed to avoid). `deep=True` additionally computes the norm of the entire
+        cached K/V tensor (a real, somewhat expensive full-tensor read) -- only use this
+        at snapshot points, not in the periodic log.
         """
         end_offset = int(self.end_offset.item())
         write_pointer = end_offset % self.capacity
         wrap_count = end_offset // self.capacity
         newest_position = end_offset - 1
         oldest_position = max(0, end_offset - self.capacity)
-        return {
+        out = {
             "capacity": self.capacity,
             "end_offset": end_offset,
             "wrap_count": wrap_count,
@@ -282,6 +313,10 @@ class RingKVCache:
             "newest_position": newest_position,
             "pct_full": round(100.0 * min(end_offset, self.capacity) / self.capacity, 1),
         }
+        if deep:
+            out["k_norm"] = float(self.cache[0].float().norm().item())
+            out["v_norm"] = float(self.cache[1].float().norm().item())
+        return out
 
     def complete(self, k: torch.Tensor, v: torch.Tensor) -> KVCacheResult:
         assert k.shape[:-1] == v.shape[:-1], (k.shape, v.shape)
@@ -311,9 +346,18 @@ class RingKVCache:
         # position should be (S - self.capacity + 1).
         # The following code gives us:
         # position(index + 1) = S + 1 + 0 - self.capacity.
-
+        #
+        # Experiment B (see EXPERIMENT_FIX_BOUNDARY_OFFBYONE, server.py --experiment B):
+        # the boundary case delta == 0 (the ring slot about to be overwritten next) is
+        # routed into the FIRST branch below by `delta <= 0`, giving position = end_offset
+        # -- but that slot's actual content is from `end_offset - capacity` (it was last
+        # written one full lap ago and hasn't been overwritten yet this lap). Verified by
+        # independent simulation (see the mechanism-investigation report): the correct
+        # condition is the strict `delta < 0`. Default (False) preserves original,
+        # unmodified behavior; only Experiment B flips this for an A/B comparison.
+        boundary_cond = (delta < 0) if EXPERIMENT_FIX_BOUNDARY_OFFBYONE else (delta <= 0)
         positions = torch.where(
-            delta <= 0,
+            boundary_cond,
             self.end_offset + delta,
             self.end_offset + delta - self.capacity,
         )
@@ -323,6 +367,37 @@ class RingKVCache:
 
     def asdict(self):
         return {"cache": self.cache, "end_offset": self.end_offset}
+
+    def verify_boundary_slot(self) -> dict:
+        """One-shot integrity check (diagnostic-only, does a real GPU read): mirrors
+        `complete()`'s own position formula for the ring slot that is about to be
+        overwritten next (`end_index = end_offset % capacity`), and compares it against
+        the mathematically correct ground truth for what step's content is actually
+        sitting there. If they disagree, that slot is being mislabeled -- which, per the
+        causal mask (`delta >= 0`), makes the causal check see a *negative* delta for
+        content that is legitimately still inside the context window, and wrongly
+        excludes it from attention one position early. See the accompanying report for
+        the full derivation and a verified fix.
+        """
+        end_offset = int(self.end_offset.item())
+        if end_offset < self.capacity:
+            return {"applicable": False, "reason": "buffer not yet full", "end_offset": end_offset}
+        end_index = end_offset % self.capacity
+        # Ground truth: the boundary slot was last written `capacity` steps before the
+        # step that's about to write there next (i.e. at absolute step `end_offset - capacity`).
+        true_position = end_offset - self.capacity
+        delta = end_index - end_index  # == 0 by construction, kept explicit to mirror complete()
+        boundary_cond = (delta < 0) if EXPERIMENT_FIX_BOUNDARY_OFFBYONE else (delta <= 0)
+        computed_position = end_offset + delta if boundary_cond else end_offset + delta - self.capacity
+        return {
+            "applicable": True,
+            "end_offset": end_offset,
+            "boundary_slot_index": end_index,
+            "true_position": true_position,
+            "computed_position": computed_position,
+            "mismatch": computed_position != true_position,
+            "experiment_b_fix_active": EXPERIMENT_FIX_BOUNDARY_OFFBYONE,
+        }
 
 
 @dataclass
@@ -443,7 +518,16 @@ class StreamingMultiheadAttention(StreamingModule[_MHAState]):
         )
 
         if self.rope:
-            q, k = self.rope(q, k, offset, time_before_heads=False)
+            # Experiment C (see EXPERIMENT_ROPE_REBASE_CONTEXT, server.py --experiment C):
+            # feed RoPE a rebased (mod context) position instead of the raw, ever-growing
+            # absolute offset -- ONLY for the rotation angle, never for the causal mask or
+            # RingKVCache indexing below, which still use the true absolute `offset`. This
+            # isolates the experiment to testing whether unbounded RoPE positions
+            # contribute to the collapse, without touching anything else.
+            rope_offset = offset
+            if self.context is not None and EXPERIMENT_ROPE_REBASE_CONTEXT is not None:
+                rope_offset = offset % EXPERIMENT_ROPE_REBASE_CONTEXT
+            q, k = self.rope(q, k, rope_offset, time_before_heads=False)
 
         k, v, pos_k = self._complete_kv(k, v)
         if self.causal:
@@ -457,7 +541,37 @@ class StreamingMultiheadAttention(StreamingModule[_MHAState]):
                 attn_bias = attn_bias & (delta < self.context)
         else:
             attn_bias = None
-        x = F.scaled_dot_product_attention(q, k, v, attn_bias, dropout_p=0.0)
+
+        if DIAG_CAPTURE_ATTENTION:
+            # Manual attention, purely for introspection -- see the module-level comment
+            # on DIAG_CAPTURE_ATTENTION for why this only fires under NO_CUDA_GRAPH=1.
+            scale = q.shape[-1] ** -0.5
+            scores = (q.float() @ k.float().transpose(-2, -1)) * scale
+            if attn_bias is not None:
+                scores = scores.masked_fill(~attn_bias, float("-inf"))
+            weights = torch.softmax(scores, dim=-1)
+            x = (weights.to(v.dtype) @ v)
+            valid = attn_bias if attn_bias is not None else torch.ones_like(weights, dtype=torch.bool)
+            active_kv = valid.sum(dim=-1).float().mean().item()
+            total_kv = valid.shape[-1]
+            w = weights.float().clamp_min(1e-12)
+            entropy = -(w * w.log()).sum(dim=-1).mean().item()
+            max_weight = weights.max(dim=-1).values.mean().item()
+            # Average weight over only the VALID (unmasked) keys -- averaging over all
+            # `capacity` slots would dilute this by however many are masked out, which
+            # varies with active_kv and would make the number hard to interpret.
+            avg_weight = (weights.sum(dim=-1) / valid.sum(dim=-1).clamp_min(1)).mean().item()
+            DIAG_ATTENTION_LOG.append({
+                "layer": getattr(self, "diag_layer_idx", None),
+                "offset": int(offset.reshape(-1)[0].item()) if offset.numel() else None,
+                "active_kv_entries": active_kv,
+                "ignored_kv_entries": total_kv - active_kv,
+                "entropy_mean": entropy,
+                "max_weight_mean": max_weight,
+                "avg_weight_mean": avg_weight,
+            })
+        else:
+            x = F.scaled_dot_product_attention(q, k, v, attn_bias, dropout_p=0.0)
 
         x = rearrange(x, "b h t d -> b t (h d)")
         if self.weights_per_step:
@@ -699,20 +813,24 @@ class StreamingTransformer(StreamingModule[_TransformerState]):
             self.rope = RotaryEmbedding(max_period=max_period)
 
         self.layers = nn.ModuleList()
-        for _ in range(num_layers):
-            self.layers.append(
-                layer_class(
-                    d_model=d_model,
-                    num_heads=num_heads,
-                    dim_feedforward=dim_feedforward,
-                    causal=causal,
-                    context=context,
-                    rope=self.rope,
-                    device=device,
-                    dtype=dtype,
-                    **kwargs,
-                )
+        for layer_idx in range(num_layers):
+            layer = layer_class(
+                d_model=d_model,
+                num_heads=num_heads,
+                dim_feedforward=dim_feedforward,
+                causal=causal,
+                context=context,
+                rope=self.rope,
+                device=device,
+                dtype=dtype,
+                **kwargs,
             )
+            # Diagnostic-only tag so DIAG_ATTENTION_LOG entries can be attributed to a
+            # specific layer (see StreamingMultiheadAttention.forward). Harmless when
+            # attention capture is off (never read).
+            if hasattr(layer, "self_attn"):
+                layer.self_attn.diag_layer_idx = layer_idx
+            self.layers.append(layer)
 
     def _init_streaming_state(self, batch_size: int) -> _TransformerState:
         device = next(self.parameters()).device

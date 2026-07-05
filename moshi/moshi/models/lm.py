@@ -699,6 +699,22 @@ class LMGen(StreamingModule[_LMGenState]):
         self.voice_prompt_embeddings: Optional[torch.Tensor] = None
         #self.voice_prompt_mimi_streaming_state: Optional[StreamingStateDict] = None
 
+        # Mechanism-investigation instrumentation (see server.py --diag-track-norms):
+        # when enabled, process_transformer_output() stashes the L2 norm of the shared
+        # hidden state (the `transformer_out` that feeds BOTH the text head and the
+        # depformer) here every step. Off by default -- costs one extra reduction over
+        # an already-computed tensor per step, negligible but not zero, so it's opt-in.
+        self.diag_track_norms = False
+        self._diag_last_hidden_norm: Optional[float] = None
+        # Only populated when diag_track_norms is on AND diag_keep_hidden_tensor is also
+        # on (the runtime investigation mode, server.py --investigate-collapse): the
+        # actual (tiny, [B, 1, dim]) hidden-state tensor, kept on-device so the caller can
+        # compute cosine similarity / L2 distance against the previous step without an
+        # extra host round-trip. Not kept by default to avoid holding a GPU reference
+        # for no reason in normal operation.
+        self.diag_keep_hidden_tensor = False
+        self._diag_last_hidden_state: Optional[torch.Tensor] = None
+
     def _init_streaming_state(self, batch_size: int) -> _LMGenState:
         lm_model = self.lm_model
         initial = lm_model._get_initial_token()
@@ -876,6 +892,15 @@ class LMGen(StreamingModule[_LMGenState]):
     def process_transformer_output(self, transformer_out, text_logits, provided_, target_, model_input_position, target_position):
         state = self._streaming_state
         lm_model = self.lm_model
+
+        if self.diag_track_norms:
+            # transformer_out is the single shared hidden state that feeds BOTH the text
+            # head (immediately below) and the depformer (for all 16 audio codebooks) --
+            # if generation collapses because this representation saturates/collapses to
+            # a fixed point, it would show up here first, upstream of both text and audio.
+            self._diag_last_hidden_norm = float(transformer_out.float().norm().item())
+            if self.diag_keep_hidden_tensor:
+                self._diag_last_hidden_state = transformer_out.float().detach().clone()
 
         # Shape of text_logits should be [B, K_text=1, T=1, Card_text]
         sampled_text_token = sample_token(
@@ -1126,10 +1151,11 @@ class LMGen(StreamingModule[_LMGenState]):
         self._step_text_prompt()
         self._step_audio_silence()
 
-    def diagnostic_snapshot(self, per_layer: bool = False) -> dict:
+    def diagnostic_snapshot(self, per_layer: bool = False, deep: bool = False) -> dict:
         """Tensor-free summary of this LMGen's entire streaming state, for forensic
         logging (see server.py's diagnostic instrumentation). Never returns tensor
-        contents -- only shapes, offsets, and cache-position metadata.
+        contents -- only shapes, offsets, cache-position metadata, and (if `deep=True`)
+        norms.
 
         `per_layer=False` (used for the frequent periodic log) reports layer 0's
         RingKVCache only: every main-transformer layer's cache advances in lockstep
@@ -1138,6 +1164,9 @@ class LMGen(StreamingModule[_LMGenState]):
         `per_layer=True` (used for one-off snapshots, which are infrequent) reports
         every layer individually, so a real divergence between layers -- which would
         itself be a very interesting finding -- can't hide behind that assumption.
+        `deep=True` also runs `RingKVCache.verify_boundary_slot()` per layer (a direct,
+        on-the-real-model check for the position-mislabeling defect found by static
+        analysis -- see the mechanism-investigation report) and includes K/V norms.
         """
         state = self._streaming_state
         out: dict = {"has_streaming_state": state is not None}
@@ -1147,6 +1176,8 @@ class LMGen(StreamingModule[_LMGenState]):
         out["cache_shape"] = list(state.cache.shape)
         out["provided_true_count"] = int(state.provided.sum().item())
         out["max_delay"] = self.max_delay
+        if deep and self._diag_last_hidden_norm is not None:
+            out["last_hidden_state_norm"] = self._diag_last_hidden_norm
 
         layers = self.lm_model.transformer.layers
         out["num_main_layers"] = len(layers)
@@ -1159,7 +1190,9 @@ class LMGen(StreamingModule[_LMGenState]):
                     entry["streaming"] = False
                 else:
                     entry["offset_cpu"] = attn_state.offset_cpu
-                    entry.update(attn_state.kv_cache.stats())
+                    entry.update(attn_state.kv_cache.stats(deep=deep))
+                    if deep:
+                        entry["boundary_slot_check"] = attn_state.kv_cache.verify_boundary_slot()
                 layer_stats.append(entry)
             out["main_transformer_layers"] = layer_stats
         else:

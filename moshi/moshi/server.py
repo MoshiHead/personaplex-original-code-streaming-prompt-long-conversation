@@ -26,9 +26,11 @@
 
 import argparse
 import asyncio
+import collections
 from dataclasses import dataclass
 import random
 import json
+import math
 import os
 from pathlib import Path
 import signal
@@ -51,6 +53,7 @@ import random
 
 from .client_utils import make_log, colorize
 from .models import loaders, MimiModel, LMModel, LMGen
+from .modules import transformer as diag_transformer
 from .modules.streaming import _flatten_streaming_state
 from .utils.connection import create_ssl_context, get_lan_ip
 from .utils.logging import setup_logger, ColorizedLog, random_id
@@ -102,7 +105,12 @@ class ServerState:
     def __init__(self, mimi: MimiModel, other_mimi: MimiModel, text_tokenizer: sentencepiece.SentencePieceProcessor,
                  lm: LMModel, device: str | torch.device, voice_prompt_dir: str | None = None,
                  save_voice_prompt_embeddings: bool = False, mute_recovery_secs: float = 0.0,
-                 diag_interval_secs: float = 5.0, diag_probs: bool = False, diag_dir: str = "."):
+                 diag_interval_secs: float = 5.0, diag_probs: bool = False, diag_dir: str = ".",
+                 diag_dump_near: int = 0, diag_dump_radius: int = 50, diag_track_norms: bool = False,
+                 investigate_collapse: bool = False, investigate_start: int = 5500,
+                 investigate_end: int = 6500, investigate_dir: str = "runtime_logs",
+                 experiment: str = "A", experiment_e_refresh_interval: int = 500,
+                 experiment_f_reset_at: int = 5000):
         self.mimi = mimi
         self.other_mimi = other_mimi
         self.text_tokenizer = text_tokenizer
@@ -110,8 +118,17 @@ class ServerState:
         self.voice_prompt_dir = voice_prompt_dir
         self.mute_recovery_secs = mute_recovery_secs
         self.diag_interval_secs = diag_interval_secs
-        self.diag_probs = diag_probs
+        self.diag_probs = diag_probs or investigate_collapse  # investigation always needs logits
         self.diag_dir = diag_dir
+        self.diag_dump_near = diag_dump_near
+        self.diag_dump_radius = diag_dump_radius
+        self.investigate_collapse = investigate_collapse
+        self.investigate_start = investigate_start
+        self.investigate_end = investigate_end
+        self.investigate_dir = investigate_dir
+        self.experiment = experiment
+        self.experiment_e_refresh_interval = experiment_e_refresh_interval
+        self.experiment_f_reset_at = experiment_f_reset_at
         self.frame_size = int(self.mimi.sample_rate / self.mimi.frame_rate)
         self.lm_gen = LMGen(lm,
                             audio_silence_frame_cnt=int(0.5 * self.mimi.frame_rate),
@@ -119,12 +136,31 @@ class ServerState:
                             device=device,
                             frame_rate=self.mimi.frame_rate,
                             save_voice_prompt_embeddings=save_voice_prompt_embeddings,
-                            return_logits=diag_probs,
+                            return_logits=self.diag_probs,
         )
+        self.lm_gen.diag_track_norms = diag_track_norms or investigate_collapse
+        self.lm_gen.diag_keep_hidden_tensor = investigate_collapse
+        if experiment == "D":
+            # Experiment D: force greedy decoding. use_sampling is an existing, already-
+            # supported LMGen constructor flag -- no new mechanism needed, just flipped.
+            self.lm_gen.use_sampling = False
 
         os.makedirs(diag_dir, exist_ok=True)
         self._diag_path = os.path.join(diag_dir, "personaplex_diag.jsonl")
         self._diag_fh = open(self._diag_path, "a", encoding="utf-8")
+        self._deep_dump_path = os.path.join(diag_dir, "personaplex_deep_dump.jsonl")
+        self._deep_dump_fh = open(self._deep_dump_path, "a", encoding="utf-8") if diag_dump_near > 0 else None
+
+        if investigate_collapse:
+            os.makedirs(investigate_dir, exist_ok=True)
+            self._inv_dir = investigate_dir
+            self._inv_fh = {
+                name: open(os.path.join(investigate_dir, f"{name}.jsonl"), "a", encoding="utf-8")
+                for name in ("logits", "hidden_state", "attention", "ringkvcache", "rope", "pad_events")
+            }
+        else:
+            self._inv_dir = investigate_dir
+            self._inv_fh = {}
 
         self.lock = asyncio.Lock()
         self.mimi.streaming_forever(1)
@@ -269,7 +305,7 @@ class ServerState:
             "label": label,
             "wall_time": time.time(),
             "elapsed_session_s": round(elapsed, 2),
-            "lm_gen": self.lm_gen.diagnostic_snapshot(per_layer=True),
+            "lm_gen": self.lm_gen.diagnostic_snapshot(per_layer=True, deep=True),
             "gpu_cpu": self._diag_gpu_cpu_stats(),
             "asyncio_tasks": self._diag_task_summary(),
         }
@@ -303,6 +339,330 @@ class ServerState:
             if a != b:
                 diffs.append((path, a, b))
         return diffs
+
+    def _diag_deep_dump_step(self, conn_id: str, offset: int, elapsed: float,
+                              text_logits: torch.Tensor, sampled_token: int) -> None:
+        """Q3 of the mechanism investigation: full top-20 + entropy + PAD/EPAD probability
+        for one generation step. Only called for steps within `diag_dump_radius` of
+        `diag_dump_near`, so the cost (a sort over the ~32k-token vocabulary) is bounded
+        to a small window, not paid on every step.
+        """
+        if self._deep_dump_fh is None:
+            return
+        probs = torch.softmax(text_logits.float() / self.lm_gen.temp_text, dim=-1).reshape(-1)
+        top_probs, top_ids = torch.topk(probs, 20)
+        top20 = [
+            {"token_id": int(tid), "prob": float(p),
+             "piece": self.text_tokenizer.id_to_piece(int(tid)).replace("▁", " ")}
+            for tid, p in zip(top_ids.tolist(), top_probs.tolist())
+        ]
+        p_clamped = probs.clamp_min(1e-12)
+        entropy = float(-(p_clamped * p_clamped.log()).sum().item())
+        record = {
+            "record_type": "deep_dump",
+            "conn_id": conn_id,
+            "offset": offset,
+            "elapsed_s": round(elapsed, 2),
+            "temperature_text": self.lm_gen.temp_text,
+            "top_k_text": self.lm_gen.top_k_text,
+            "use_sampling": self.lm_gen.use_sampling,
+            "entropy": entropy,
+            "sampled_token_id": sampled_token,
+            "sampled_token_piece": self.text_tokenizer.id_to_piece(sampled_token).replace("▁", " ") if sampled_token not in (0, self.lm_gen.zero_text_code) else ("EPAD" if sampled_token == 0 else "PAD"),
+            "sampled_token_prob": float(probs[sampled_token].item()),
+            "pad_prob": float(probs[self.lm_gen.zero_text_code].item()),
+            "epad_prob": float(probs[0].item()),
+            "top20": top20,
+        }
+        self._deep_dump_fh.write(json.dumps(record, default=str) + "\n")
+        self._deep_dump_fh.flush()
+
+    # ------------------------------------------------------------------
+    # Deep runtime investigation mode (--investigate-collapse): automatically captures
+    # logits, hidden-state, attention, RingKVCache, and RoPE evidence in a narrow window
+    # around state.offset, plus optional A/B experiments (--experiment A-F), so ONE
+    # reproduction is enough to prove or reject each remaining hypothesis about why
+    # generation permanently collapses around offset ~2x context capacity. Everything
+    # here is gated to the [--investigate-start, --investigate-end] window (except
+    # Experiment E/F's mid-session actions, which are deliberately session-wide) so a
+    # normal, non-investigation run pays zero cost.
+    # ------------------------------------------------------------------
+
+    def _inv_write(self, stream: str, record: dict) -> None:
+        fh = self._inv_fh.get(stream)
+        if fh is None:
+            return
+        record.setdefault("wall_time", time.time())
+        fh.write(json.dumps(record, default=str) + "\n")
+        fh.flush()
+
+    def _inv_log_logits(self, conn_id: str, offset: int, elapsed: float,
+                         text_logits: torch.Tensor, sampled_token: int) -> tuple[float, float]:
+        """Q2/Q3: full top-50 distribution, entropy, PAD/EPAD probability, and whether
+        the sampler actually agreed with the model's own argmax. Returns (pad_prob, entropy)
+        for use by the PAD-attractor and report logic."""
+        probs = torch.softmax(text_logits.float() / self.lm_gen.temp_text, dim=-1).reshape(-1)
+        top_probs, top_ids = torch.topk(probs, 50)
+        top50 = [
+            {"token_id": int(t), "prob": float(p),
+             "piece": self.text_tokenizer.id_to_piece(int(t)).replace("▁", " ")}
+            for t, p in zip(top_ids.tolist(), top_probs.tolist())
+        ]
+        p_clamped = probs.clamp_min(1e-12)
+        entropy = float(-(p_clamped * p_clamped.log()).sum().item())
+        argmax_token = int(torch.argmax(probs).item())
+        pad_prob = float(probs[self.lm_gen.zero_text_code].item())
+        self._inv_write("logits", {
+            "record_type": "logits", "conn_id": conn_id, "offset": offset, "elapsed_s": round(elapsed, 2),
+            "top50": top50,
+            "pad_prob": pad_prob,
+            "epad_prob": float(probs[0].item()),
+            "entropy": entropy,
+            "argmax_token": argmax_token,
+            "sampled_token": sampled_token,
+            "sampled_equals_argmax": sampled_token == argmax_token,
+            "temperature": self.lm_gen.temp_text,
+            "top_k": self.lm_gen.top_k_text,
+            "use_sampling": self.lm_gen.use_sampling,
+        })
+        return pad_prob, entropy
+
+    def _inv_log_hidden(self, conn_id: str, offset: int, elapsed: float, inv_state: dict) -> Optional[float]:
+        """Q7: hidden-state norm, cosine similarity + L2 distance to the previous step's
+        hidden state, and a running average -- looking for a sudden collapse, saturation,
+        or explosion in the single representation shared by the text head and depformer."""
+        h = self.lm_gen._diag_last_hidden_state
+        norm = self.lm_gen._diag_last_hidden_norm
+        if h is None or norm is None:
+            return None
+        prev = inv_state.get("prev_hidden")
+        cosine = l2 = None
+        if prev is not None:
+            cosine = float(torch.nn.functional.cosine_similarity(h.reshape(1, -1), prev.reshape(1, -1)).item())
+            l2 = float((h - prev).norm().item())
+        inv_state["hidden_running_sum"] = inv_state.get("hidden_running_sum", 0.0) + norm
+        inv_state["hidden_running_count"] = inv_state.get("hidden_running_count", 0) + 1
+        running_avg = inv_state["hidden_running_sum"] / inv_state["hidden_running_count"]
+        self._inv_write("hidden_state", {
+            "record_type": "hidden_state", "conn_id": conn_id, "offset": offset, "elapsed_s": round(elapsed, 2),
+            "hidden_state_norm": norm,
+            "cosine_similarity_to_prev": cosine,
+            "l2_distance_to_prev": l2,
+            "running_average_norm": running_avg,
+        })
+        inv_state["prev_hidden"] = h.clone()
+        return norm
+
+    def _inv_log_attention(self, conn_id: str, offset: int, elapsed: float) -> None:
+        """Q4: drains transformer.DIAG_ATTENTION_LOG (populated by every main-transformer
+        layer's forward this step -- see StreamingMultiheadAttention.forward) and clears
+        it, so it never grows beyond one step's worth of entries in memory. Only
+        non-empty while DIAG_CAPTURE_ATTENTION is toggled on, which this class only does
+        while inside the investigation window (see _inv_step)."""
+        entries = list(diag_transformer.DIAG_ATTENTION_LOG)
+        diag_transformer.DIAG_ATTENTION_LOG.clear()
+        if not entries:
+            return
+        self._inv_write("attention", {
+            "record_type": "attention", "conn_id": conn_id, "offset": offset, "elapsed_s": round(elapsed, 2),
+            "layers": entries,
+            "entropy_mean_across_layers": sum(e["entropy_mean"] for e in entries) / len(entries),
+            "max_weight_mean_across_layers": sum(e["max_weight_mean"] for e in entries) / len(entries),
+            "active_kv_mean_across_layers": sum(e["active_kv_entries"] for e in entries) / len(entries),
+        })
+
+    def _inv_log_ringkvcache(self, conn_id: str, offset: int, elapsed: float) -> int:
+        """Q5: per-layer write pointer / oldest / newest / wrap count / boundary-slot
+        verification, for every main-transformer layer. Returns the mismatch count so the
+        caller can track it for the auto-report."""
+        layers = self.lm_gen.lm_model.transformer.layers
+        mismatches = 0
+        layer_records = []
+        for i, layer in enumerate(layers):
+            attn_state = layer.self_attn._streaming_state
+            if attn_state is None:
+                continue
+            s = attn_state.kv_cache.stats()
+            check = attn_state.kv_cache.verify_boundary_slot()
+            if check.get("mismatch"):
+                mismatches += 1
+            layer_records.append({"layer": i, **s, "boundary_check": check})
+        self._inv_write("ringkvcache", {
+            "record_type": "ringkvcache", "conn_id": conn_id, "offset": offset, "elapsed_s": round(elapsed, 2),
+            "layers": layer_records,
+            "mismatch_count": mismatches,
+        })
+        return mismatches
+
+    def _inv_log_rope(self, conn_id: str, offset: int, elapsed: float) -> None:
+        """Q6: absolute vs. rebased (if Experiment C is active) position fed to RoPE, plus
+        the resulting angle range -- computed directly from the offset and model config
+        in plain Python (NOT by touching rope.py's torch.compile'd apply_rope), so this
+        carries zero risk to the actual inference path. Layer 0 is representative: all
+        layers share the same offset and RoPE config."""
+        layer0 = self.lm_gen.lm_model.transformer.layers[0].self_attn
+        dim_per_head = layer0.embed_dim // layer0.num_heads
+        rope_mod = self.lm_gen.lm_model.transformer.rope
+        max_period = rope_mod.max_period if rope_mod is not None else None
+        rebase_context = diag_transformer.EXPERIMENT_ROPE_REBASE_CONTEXT
+        rope_position = (offset % rebase_context) if rebase_context else offset
+        record = {
+            "record_type": "rope", "conn_id": conn_id, "offset": offset, "elapsed_s": round(elapsed, 2),
+            "absolute_position": offset,
+            "rope_position_used": rope_position,
+            "rebase_active": rebase_context is not None,
+        }
+        if max_period and dim_per_head and dim_per_head > 2:
+            half = dim_per_head // 2
+            min_freq = math.exp(-(half - 1) * (math.log(max_period) * 2 / dim_per_head))
+            record["max_angle_radians"] = rope_position * 1.0  # highest-frequency component, freq=1
+            record["min_angle_radians"] = rope_position * min_freq  # lowest-frequency component
+            record["max_period"] = max_period
+        self._inv_write("rope", record)
+
+    def _inv_check_pad_events(self, conn_id: str, offset: int, elapsed: float,
+                               pad_prob: float, inv_state: dict) -> None:
+        """Q7 (PAD attractor): fires once per threshold, the first time PAD probability
+        crosses it, with the last 50 generated tokens and current hidden/attention/logits
+        summary attached -- pins down exactly when PAD first becomes dominant."""
+        crossed = inv_state.setdefault("pad_thresholds_crossed", set())
+        for threshold in (0.10, 0.20, 0.50, 0.80, 0.95):
+            if pad_prob >= threshold and threshold not in crossed:
+                crossed.add(threshold)
+                self._inv_write("pad_events", {
+                    "record_type": "pad_event", "conn_id": conn_id, "offset": offset,
+                    "elapsed_s": round(elapsed, 2), "threshold": threshold, "pad_prob": pad_prob,
+                    "recent_tokens": list(inv_state.get("recent_tokens", [])),
+                    "hidden_state_norm": self.lm_gen._diag_last_hidden_norm,
+                })
+
+    def _inv_save_pt_snapshot(self, label: str) -> str:
+        """Full streaming-state snapshot (every layer's real K/V tensors, not just
+        metadata) saved via torch.save for later offline comparison -- reuses the exact
+        same snapshot format already trusted for mute-recovery (_snapshot_lm_gen_state)."""
+        path = os.path.join(self._inv_dir, f"{label}.pt")
+        torch.save(self._snapshot_lm_gen_state(), path)
+        return path
+
+    def _inv_generate_report(self, conn_id: str, inv_state: dict) -> str:
+        """Builds investigation_report.md from what was ACTUALLY measured this run --
+        every claim below is derived from inv_state's accumulated data, not asserted.
+        Sections that can't be filled from this run's data say so explicitly rather than
+        omitting them silently."""
+        lines = ["# Investigation Report", "", f"conn_id: `{conn_id}`  experiment: `{self.experiment}`",
+                  f"window: offset [{self.investigate_start}, {self.investigate_end}]", ""]
+
+        entropies = inv_state.get("entropy_values", [])
+        pad_probs = inv_state.get("pad_prob_values", [])
+        hidden_norms = inv_state.get("hidden_norm_values", [])
+        mismatch_total = inv_state.get("ringkv_mismatch_total", 0)
+        thresholds_crossed = sorted(inv_state.get("pad_thresholds_crossed", set()))
+        offsets_logged = inv_state.get("offsets_logged", [])
+
+        lines += ["## Proven facts (directly measured this run)", ""]
+        if offsets_logged:
+            lines.append(f"- Dense logging captured {len(offsets_logged)} steps, "
+                          f"offset {offsets_logged[0]} to {offsets_logged[-1]}.")
+        if pad_probs:
+            lines.append(f"- PAD probability ranged from {min(pad_probs):.4f} to {max(pad_probs):.4f} "
+                         f"across the window; final value {pad_probs[-1]:.4f}.")
+        if thresholds_crossed:
+            lines.append(f"- PAD probability crossed thresholds {thresholds_crossed} during this run "
+                         f"(see pad_events.jsonl for the exact offset/context of each).")
+        else:
+            lines.append("- PAD probability never crossed the 10% threshold in this window -- "
+                         "either the collapse didn't happen in this run/window, or it happens "
+                         "outside [--investigate-start, --investigate-end] for this configuration.")
+        if hidden_norms:
+            change_pct = 100.0 * (hidden_norms[-1] - hidden_norms[0]) / max(abs(hidden_norms[0]), 1e-6)
+            lines.append(f"- Hidden-state norm: start={hidden_norms[0]:.3f}, end={hidden_norms[-1]:.3f} "
+                         f"({change_pct:+.1f}% change over the window).")
+        lines.append(f"- RingKVCache boundary-slot mismatches observed: {mismatch_total} "
+                     f"(Experiment B active: {self.experiment == 'B'}).")
+
+        lines += ["", "## Rejected hypotheses (this run's evidence)", ""]
+        if mismatch_total == 0 and self.experiment == "B":
+            lines.append("- RingKVCache boundary off-by-one: absent in this run (Experiment B fix active) "
+                         "-- if collapse still occurred, that rules out this bug as the sole cause.")
+        if hidden_norms and abs(100.0 * (hidden_norms[-1] - hidden_norms[0]) / max(abs(hidden_norms[0]), 1e-6)) < 5:
+            lines.append("- Hidden-state exploding/vanishing: NOT supported -- norm changed by "
+                         "less than 5% across the window.")
+
+        lines += ["", "## Supported hypotheses (this run's evidence)", ""]
+        if entropies and len(entropies) > 1 and entropies[-1] < 0.5 * entropies[0]:
+            lines.append(f"- Attention/output collapse toward a narrow distribution: entropy dropped "
+                         f"from {entropies[0]:.3f} to {entropies[-1]:.3f} ({100*(1-entropies[-1]/entropies[0]):.0f}% "
+                         f"reduction) across the window -- consistent with a collapse into a low-entropy attractor.")
+        if hidden_norms and len(hidden_norms) > 1 and abs(100.0 * (hidden_norms[-1] - hidden_norms[0]) / max(abs(hidden_norms[0]), 1e-6)) >= 5:
+            lines.append(f"- Hidden-state drift: norm changed by "
+                         f"{100.0 * (hidden_norms[-1] - hidden_norms[0]) / max(abs(hidden_norms[0]), 1e-6):+.1f}% "
+                         f"across the window -- worth comparing against Experiment C (RoPE rebase) to see "
+                         f"if this drift shrinks.")
+        if mismatch_total > 0 and self.experiment == "A":
+            lines.append(f"- RingKVCache boundary mismatch is real and active in this run "
+                         f"({mismatch_total} occurrences logged) -- compare against an Experiment B "
+                         f"run to see if fixing it changes the collapse offset.")
+
+        lines += ["", "## Remaining unknowns", ""]
+        lines.append("- Whether this specific run's pattern (gradual ramp vs. sudden jump in PAD "
+                     "probability) generalizes across different personas/voice prompts -- this run "
+                     "only characterizes one configuration.")
+        if self.experiment == "A":
+            lines.append("- Whether Experiments B-F individually shift, delay, or eliminate the collapse "
+                         "-- requires running each and comparing its own investigation_report.md against "
+                         "this baseline.")
+        lines.append("- The model's actual trained maximum position / sequence length is not documented "
+                     "in this repository and cannot be determined from runtime evidence alone.")
+
+        lines += ["", "## Suggested next experiment", ""]
+        if self.experiment == "A":
+            if pad_probs and thresholds_crossed and 0.95 in thresholds_crossed:
+                # Find how abrupt the final approach to collapse was.
+                lines.append("- Run **Experiment C** (`--experiment C`, RoPE rebase) with the same "
+                             "--investigate-start/--investigate-end: if PAD probability no longer "
+                             "reaches the thresholds it did here, absolute RoPE position is implicated; "
+                             "if the pattern is unchanged, RoPE can be ruled out with high confidence.")
+            else:
+                lines.append("- Widen the window (`--investigate-start`/`--investigate-end`) and rerun "
+                             "baseline: this run's window may not have bracketed the actual collapse point.")
+        else:
+            lines.append(f"- Compare this Experiment {self.experiment} run's investigation_report.md "
+                         f"against the Experiment A baseline's: did the offset of first PAD-threshold "
+                         f"crossing move, and by how much?")
+
+        report = "\n".join(lines) + "\n"
+        # Named investigation_report_<conn>_<experiment>.md rather than the literal
+        # investigation_report.md -- running multiple experiments (the whole point of the
+        # A-F comparison) into the same shared directory would otherwise have each run
+        # silently overwrite the previous one's report. Same reasoning for
+        # experiment_summary.json below.
+        report_path = os.path.join(self._inv_dir, f"investigation_report_{conn_id}_{self.experiment}.md")
+        with open(report_path, "w", encoding="utf-8") as f:
+            f.write(report)
+
+        summary = {
+            "conn_id": conn_id,
+            "experiment": self.experiment,
+            "window": [self.investigate_start, self.investigate_end],
+            "steps_logged": len(offsets_logged),
+            "offset_range_logged": [offsets_logged[0], offsets_logged[-1]] if offsets_logged else None,
+            "pad_prob_range": [min(pad_probs), max(pad_probs)] if pad_probs else None,
+            "pad_prob_final": pad_probs[-1] if pad_probs else None,
+            "pad_thresholds_crossed": thresholds_crossed,
+            "entropy_range": [min(entropies), max(entropies)] if entropies else None,
+            "entropy_final": entropies[-1] if entropies else None,
+            "hidden_norm_range": [min(hidden_norms), max(hidden_norms)] if hidden_norms else None,
+            "hidden_norm_start_end": [hidden_norms[0], hidden_norms[-1]] if hidden_norms else None,
+            "ringkv_mismatch_total": mismatch_total,
+            "experiment_b_fix_active": self.experiment == "B",
+            "experiment_c_rope_rebase_active": self.experiment == "C",
+            "window_ever_reached": bool(offsets_logged),
+            "report_path": report_path,
+        }
+        summary_path = os.path.join(self._inv_dir, f"experiment_summary_{conn_id}_{self.experiment}.json")
+        with open(summary_path, "w", encoding="utf-8") as f:
+            json.dump(summary, f, indent=2, default=str)
+        return report_path
 
     def warmup(self):
         for _ in range(4):
@@ -390,6 +750,17 @@ class ServerState:
             "ws_last_send_time": time.time(),
         }
 
+        # --investigate-collapse state, declared here (not inside opus_loop) so it's
+        # still readable after the session ends -- see the fallback report generation
+        # at the end of this function, for sessions that close before state.offset ever
+        # reaches --investigate-end.
+        inv_state = {
+            "recent_tokens": collections.deque(maxlen=50),
+            "entropy_values": [], "pad_prob_values": [], "hidden_norm_values": [],
+            "offsets_logged": [], "ringkv_mismatch_total": 0,
+            "entered": False, "finished": False,
+        }
+
         async def recv_loop():
             nonlocal close
             try:
@@ -469,6 +840,12 @@ class ServerState:
                 (330, "t330s"), (345, "t345s"), (360, "t360s"),
             ]
 
+            # --- --investigate-collapse state (see the _inv_* methods on ServerState) ---
+            # `inv_state` itself is declared in handle_chat's scope (not here), so it's
+            # still readable after this coroutine ends, for the fallback report generation.
+            inv_e_last_refresh_offset = 0
+            inv_f_reset_done = False
+
             while True:
                 if close:
                     return
@@ -480,6 +857,34 @@ class ServerState:
                     _, label = pending_snapshots.pop(0)
                     self._diag_snapshot(diag_conn_id, label, elapsed)
                     clog.log("info", f"DIAG snapshot '{label}' taken at {elapsed:.1f}s elapsed")
+
+                if self.investigate_collapse:
+                    _cur_off = self.lm_gen._streaming_state.offset
+                    # Experiment E: periodic persona refresh -- re-feed the text prompt
+                    # tokens through step() as-is (no state reset), exactly like initial
+                    # prompt loading, so they naturally occupy new ring slots. Session-wide
+                    # by design (testing whether this prevents the collapse from ever
+                    # being reached, not just observing it inside the narrow window).
+                    if self.experiment == "E" and self.lm_gen.text_prompt_tokens and \
+                            _cur_off - inv_e_last_refresh_offset >= self.experiment_e_refresh_interval:
+                        inv_e_last_refresh_offset = _cur_off
+                        self._mark_progress("opus_loop: experiment E persona refresh")
+                        refresh_start = time.time()
+                        self.lm_gen._step_text_prompt()
+                        self._diag_event(diag_conn_id, clog, "experiment_e_refresh",
+                                          offset_before=_cur_off, duration_s=round(time.time() - refresh_start, 2))
+                    # Experiment F: one-time hidden-state reset at a configured offset,
+                    # WITHOUT reconnecting -- reuses the exact same instant snapshot/restore
+                    # already trusted for mute recovery, just triggered by offset instead of
+                    # by silence, and only once, to test whether resetting before the
+                    # collapse point prevents it.
+                    if self.experiment == "F" and not inv_f_reset_done and _cur_off >= self.experiment_f_reset_at:
+                        inv_f_reset_done = True
+                        self._mark_progress("opus_loop: experiment F one-time reset")
+                        self._restore_lm_gen_state(persona_snapshot)
+                        _ = opus_reader.read_pcm()
+                        all_pcm_data = None
+                        self._diag_event(diag_conn_id, clog, "experiment_f_reset", offset=_cur_off)
 
                 if self.mute_recovery_secs > 0 and (time.time() - last_text_time) > self.mute_recovery_secs:
                     # The model has not produced a single word in `mute_recovery_secs`. In our
@@ -628,6 +1033,45 @@ class ServerState:
                                 prob_sampled_sum += float(probs[0, 0, 0, text_token].item())
                                 prob_pad_sum += float(probs[0, 0, 0, self.lm_gen.zero_text_code].item())
                                 prob_count += 1
+                                if self.diag_dump_near > 0 and abs(current_offset - self.diag_dump_near) <= self.diag_dump_radius:
+                                    self._diag_deep_dump_step(diag_conn_id, current_offset, elapsed, text_logits, text_token)
+
+                            if self.investigate_collapse:
+                                in_window = self.investigate_start <= current_offset <= self.investigate_end
+                                if in_window and not inv_state["entered"]:
+                                    inv_state["entered"] = True
+                                    diag_transformer.DIAG_CAPTURE_ATTENTION = True
+                                    snap_path = self._inv_save_pt_snapshot("before_silence_snapshot")
+                                    self._diag_event(diag_conn_id, clog, "investigation_window_entered",
+                                                      offset=current_offset, snapshot=snap_path)
+                                if in_window and not inv_state["finished"]:
+                                    inv_state["offsets_logged"].append(current_offset)
+                                    if text_logits is not None:
+                                        pad_prob, entropy = self._inv_log_logits(
+                                            diag_conn_id, current_offset, elapsed, text_logits, text_token)
+                                        inv_state["pad_prob_values"].append(pad_prob)
+                                        inv_state["entropy_values"].append(entropy)
+                                        self._inv_check_pad_events(diag_conn_id, current_offset, elapsed, pad_prob, inv_state)
+                                    hnorm = self._inv_log_hidden(diag_conn_id, current_offset, elapsed, inv_state)
+                                    if hnorm is not None:
+                                        inv_state["hidden_norm_values"].append(hnorm)
+                                    self._inv_log_attention(diag_conn_id, current_offset, elapsed)
+                                    inv_state["ringkv_mismatch_total"] += self._inv_log_ringkvcache(
+                                        diag_conn_id, current_offset, elapsed)
+                                    self._inv_log_rope(diag_conn_id, current_offset, elapsed)
+                                    piece = ("PAD" if text_token == self.lm_gen.zero_text_code
+                                              else "EPAD" if text_token == 0
+                                              else self.text_tokenizer.id_to_piece(text_token).replace("▁", " "))
+                                    inv_state["recent_tokens"].append(piece)
+                                elif current_offset > self.investigate_end and not inv_state["finished"]:
+                                    inv_state["finished"] = True
+                                    diag_transformer.DIAG_CAPTURE_ATTENTION = False
+                                    after_path = self._inv_save_pt_snapshot("after_silence_snapshot")
+                                    report_path = self._inv_generate_report(diag_conn_id, inv_state)
+                                    self._diag_event(diag_conn_id, clog, "investigation_window_finished",
+                                                      offset=current_offset, snapshot=after_path, report=report_path)
+                                    clog.log("warning", f"INVESTIGATION COMPLETE: report written to {report_path}")
+
                             if text_token == 0:
                                 epad_tokens_since_report += 1
                             elif text_token == self.lm_gen.zero_text_code:  # 3 == PAD
@@ -851,6 +1295,22 @@ class ServerState:
                 await ws.close()
                 clog.log("info", "session closed")
                 # await asyncio.gather(opus_loop(), recv_loop(), send_loop())
+        if self.investigate_collapse and not inv_state["finished"]:
+            # The session ended (disconnect, error, or the user just stopped talking)
+            # before state.offset ever reached --investigate-end. Generate the report
+            # anyway from whatever was captured, rather than silently producing nothing --
+            # it will say plainly if the window was never reached or only partially covered.
+            inv_state["finished"] = True
+            diag_transformer.DIAG_CAPTURE_ATTENTION = False
+            if inv_state["entered"]:
+                after_path = self._inv_save_pt_snapshot("after_silence_snapshot")
+            else:
+                after_path = None
+                self._diag_event(diag_conn_id, clog, "investigation_window_never_reached",
+                                  final_offset=self.lm_gen._streaming_state.offset if self.lm_gen.is_streaming else None)
+            report_path = self._inv_generate_report(diag_conn_id, inv_state)
+            clog.log("warning", f"INVESTIGATION (session ended before window closed): "
+                                 f"report written to {report_path}")
         self._mark_progress("idle")
         clog.log("info", "done with connection")
         return ws
@@ -977,6 +1437,45 @@ def main():
                         help="Directory for diagnostic output: personaplex_diag.jsonl (structured "
                              "periodic/event/snapshot-pointer log) plus one snapshot_<conn>_<label>.json "
                              "file per snapshot. Defaults to the current directory.")
+    parser.add_argument("--diag-dump-near", type=int, default=0,
+                        help="Mechanism investigation (Q3): if > 0, write a full top-20-token / "
+                             "entropy / PAD-probability dump to personaplex_diag_deep_dump.jsonl for "
+                             "every step within --diag-dump-radius of this state.offset value. "
+                             "Requires --diag-probs. 0 disables (default).")
+    parser.add_argument("--diag-dump-radius", type=int, default=50,
+                        help="Window (in steps) around --diag-dump-near to deep-dump. Default 50.")
+    parser.add_argument("--diag-track-norms", action="store_true",
+                        help="Mechanism investigation (Q7): track the L2 norm of the shared hidden "
+                             "state (transformer_out) every step, included in snapshots. Small added "
+                             "per-step cost -- off by default.")
+    parser.add_argument("--investigate-collapse", action="store_true",
+                        help="Deep runtime investigation mode: automatically captures logits, "
+                             "hidden-state, attention, RingKVCache, and RoPE evidence when "
+                             "state.offset enters [--investigate-start, --investigate-end], plus an "
+                             "auto-generated investigation_report.md at the end. Forces "
+                             "NO_CUDA_GRAPH=1 (required for attention capture) and --diag-probs -- "
+                             "expect reduced throughput for the duration of this run.")
+    parser.add_argument("--investigate-start", type=int, default=5500,
+                        help="state.offset at which dense investigation logging begins. Default 5500.")
+    parser.add_argument("--investigate-end", type=int, default=6500,
+                        help="state.offset at which dense investigation logging ends and the "
+                             "investigation_report.md is generated. Default 6500.")
+    parser.add_argument("--investigate-dir", type=str, default="runtime_logs",
+                        help="Directory for investigation output: logits.jsonl, hidden_state.jsonl, "
+                             "attention.jsonl, ringkvcache.jsonl, rope.jsonl, pad_events.jsonl, "
+                             "before/after_silence_snapshot.pt, and investigation_report_*.md. "
+                             "Default './runtime_logs'.")
+    parser.add_argument("--experiment", type=str, default="A", choices=["A", "B", "C", "D", "E", "F"],
+                        help="A=baseline, no modification (default). B=fix the RingKVCache boundary "
+                             "off-by-one (delta<0 instead of delta<=0). C=RoPE rebase (offset %% "
+                             "context) for the rotation angle only, not the causal mask or cache "
+                             "indexing. D=force greedy decoding (argmax, no sampling). E=periodic "
+                             "persona refresh every --experiment-e-refresh-interval steps. F=one-time "
+                             "LM hidden-state reset at --experiment-f-reset-at, without reconnecting.")
+    parser.add_argument("--experiment-e-refresh-interval", type=int, default=500,
+                        help="Experiment E: steps between persona-refresh reinjections. Default 500.")
+    parser.add_argument("--experiment-f-reset-at", type=int, default=5000,
+                        help="Experiment F: state.offset at which the one-time reset fires. Default 5000.")
     parser.add_argument(
         "--voice-prompt-dir",
         type=str,
@@ -996,6 +1495,23 @@ def main():
     )
 
     args = parser.parse_args()
+
+    if args.investigate_collapse:
+        # Must happen before any model is loaded/warmed up: CUDAGraphed captures its
+        # kernel sequence on first real use, and NO_CUDA_GRAPH / the experiment globals
+        # below need to be in their final state before that capture happens, or the
+        # capture would bake in the WRONG (pre-flag) behavior and ignore later changes.
+        os.environ["NO_CUDA_GRAPH"] = "1"
+        diag_transformer.DIAG_CAPTURE_ATTENTION = False  # toggled on/off around the window at runtime
+        if args.experiment == "B":
+            diag_transformer.EXPERIMENT_FIX_BOUNDARY_OFFBYONE = True
+        if args.experiment == "C":
+            diag_transformer.EXPERIMENT_ROPE_REBASE_CONTEXT = loaders._lm_kwargs["context"]
+        logger.warning(
+            f"--investigate-collapse: forcing NO_CUDA_GRAPH=1, running experiment "
+            f"'{args.experiment}'. Expect reduced throughput for this run."
+        )
+
     args.voice_prompt_dir = _get_voice_prompt_dir(
         args.voice_prompt_dir,
         args.hf_repo,
@@ -1061,8 +1577,27 @@ def main():
         diag_interval_secs=args.diag_interval_secs,
         diag_probs=args.diag_probs,
         diag_dir=args.diag_dir,
+        diag_dump_near=args.diag_dump_near,
+        diag_dump_radius=args.diag_dump_radius,
+        diag_track_norms=args.diag_track_norms,
+        investigate_collapse=args.investigate_collapse,
+        investigate_start=args.investigate_start,
+        investigate_end=args.investigate_end,
+        investigate_dir=args.investigate_dir,
+        experiment=args.experiment,
+        experiment_e_refresh_interval=args.experiment_e_refresh_interval,
+        experiment_f_reset_at=args.experiment_f_reset_at,
     )
+    if args.diag_dump_near > 0 and not args.diag_probs:
+        logger.warning("--diag-dump-near requires --diag-probs to actually capture logits; "
+                        "the deep-dump file will stay empty without it.")
     logger.info(f"diagnostic log: {state._diag_path}")
+    if state._deep_dump_fh is not None:
+        logger.info(f"deep-dump log (near offset {args.diag_dump_near}): {state._deep_dump_path}")
+    if args.investigate_collapse:
+        logger.info(f"investigation mode ON: experiment={args.experiment}, "
+                    f"window=[{args.investigate_start}, {args.investigate_end}], "
+                    f"output dir={args.investigate_dir}")
     logger.info("warming up the model")
     state.warmup()
     threading.Thread(target=state._watchdog_loop, daemon=True, name="hang-watchdog").start()
