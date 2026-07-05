@@ -53,6 +53,7 @@ import random
 
 from .client_utils import make_log, colorize
 from .models import loaders, MimiModel, LMModel, LMGen
+from .models.lm import load_audio
 from .modules import transformer as diag_transformer
 from .modules.streaming import _flatten_streaming_state
 from .utils.connection import create_ssl_context, get_lan_ip
@@ -664,6 +665,219 @@ class ServerState:
             json.dump(summary, f, indent=2, default=str)
         return report_path
 
+    def _inv_process_step(self, conn_id: str, clog, current_offset: int, elapsed: float,
+                           text_logits, text_token, inv_state: dict) -> None:
+        """Shared per-step investigation logic: entering/leaving the [investigate_start,
+        investigate_end] window, dense logging while inside it, and report generation on
+        exit. Used identically by the live opus_loop and by run_investigation_suite's
+        batch driver so the two code paths can never silently diverge."""
+        in_window = self.investigate_start <= current_offset <= self.investigate_end
+        if in_window and not inv_state["entered"]:
+            inv_state["entered"] = True
+            diag_transformer.DIAG_CAPTURE_ATTENTION = True
+            snap_path = self._inv_save_pt_snapshot("before_silence_snapshot")
+            self._diag_event(conn_id, clog, "investigation_window_entered",
+                              offset=current_offset, snapshot=snap_path)
+        if in_window and not inv_state["finished"]:
+            inv_state["offsets_logged"].append(current_offset)
+            if text_logits is not None:
+                pad_prob, entropy = self._inv_log_logits(
+                    conn_id, current_offset, elapsed, text_logits, text_token)
+                inv_state["pad_prob_values"].append(pad_prob)
+                inv_state["entropy_values"].append(entropy)
+                self._inv_check_pad_events(conn_id, current_offset, elapsed, pad_prob, inv_state)
+            hnorm = self._inv_log_hidden(conn_id, current_offset, elapsed, inv_state)
+            if hnorm is not None:
+                inv_state["hidden_norm_values"].append(hnorm)
+            self._inv_log_attention(conn_id, current_offset, elapsed)
+            inv_state["ringkv_mismatch_total"] += self._inv_log_ringkvcache(
+                conn_id, current_offset, elapsed)
+            self._inv_log_rope(conn_id, current_offset, elapsed)
+            piece = ("PAD" if text_token == self.lm_gen.zero_text_code
+                      else "EPAD" if text_token == 0
+                      else self.text_tokenizer.id_to_piece(text_token).replace("▁", " "))
+            inv_state["recent_tokens"].append(piece)
+        elif current_offset > self.investigate_end and not inv_state["finished"]:
+            inv_state["finished"] = True
+            diag_transformer.DIAG_CAPTURE_ATTENTION = False
+            after_path = self._inv_save_pt_snapshot("after_silence_snapshot")
+            report_path = self._inv_generate_report(conn_id, inv_state)
+            self._diag_event(conn_id, clog, "investigation_window_finished",
+                              offset=current_offset, snapshot=after_path, report=report_path)
+            clog.log("warning", f"INVESTIGATION COMPLETE: report written to {report_path}")
+
+    def run_investigation_suite(
+        self,
+        voice_prompt_filename: str,
+        text_prompt: str,
+        experiments: Optional[list] = None,
+        max_offset: Optional[int] = None,
+        input_wav_path: Optional[str] = None,
+    ) -> dict:
+        """Runs experiments A-F back-to-back in-process -- one model load, no live client,
+        no human sitting through six separate 6-9 minute conversations.
+
+        Audio is plain silence (the same zero/sine filler `step_system_prompts` already
+        uses around the voice/text prompt), fed synchronously until `max_offset`. This is
+        deliberate, not a shortcut: the investigation already established -- from
+        `ring_cache_wrap`/`offset_milestone` events across 20+ live reproductions, all
+        failing at the same offset regardless of what was actually said -- that
+        state.offset advances one step per audio frame independent of conversation
+        content. A silence-only feed reaches the same offset-6033 region a live
+        conversation would, and (with no websocket/real-time throttle in the way) does it
+        in a fraction of the wall-clock time. Pass `input_wav_path` to play a real
+        recording first, for a more realistic transcript in each report's early section;
+        silence still fills the rest up to `max_offset`.
+
+        Returns {experiment: investigation_report_path}.
+        """
+        if experiments is None:
+            experiments = ["A", "B", "C", "D", "E", "F"]
+        if max_offset is None:
+            max_offset = self.investigate_end + 200
+
+        voice_prompt_path = (os.path.join(self.voice_prompt_dir, voice_prompt_filename)
+                              if self.voice_prompt_dir else voice_prompt_filename)
+        if voice_prompt_path.endswith(".pt"):
+            self.lm_gen.load_voice_prompt_embeddings(voice_prompt_path)
+        else:
+            self.lm_gen.load_voice_prompt(voice_prompt_path)
+        self.lm_gen.text_prompt_tokens = (
+            self.text_tokenizer.encode(wrap_with_system_tags(text_prompt)) if text_prompt else None
+        )
+
+        prefix_pcm_master = None
+        if input_wav_path is not None:
+            prefix_pcm_master = load_audio(input_wav_path, self.mimi.sample_rate)  # (1, T)
+
+        default_use_sampling = self.lm_gen.use_sampling
+        results: dict = {}
+
+        for exp in experiments:
+            clog = ColorizedLog.randomize()
+            conn_id = f"suite_{exp}"
+            exp_start = time.time()
+            logger.info(f"=== run_investigation_suite: starting experiment {exp} ===")
+
+            # Reset every per-experiment global to a known baseline before applying this
+            # experiment's own override -- otherwise a flag left on by a previous
+            # experiment in this same loop (e.g. B's boundary fix) would silently leak
+            # into the next one.
+            diag_transformer.EXPERIMENT_FIX_BOUNDARY_OFFBYONE = False
+            diag_transformer.EXPERIMENT_ROPE_REBASE_CONTEXT = None
+            diag_transformer.DIAG_CAPTURE_ATTENTION = False
+            diag_transformer.DIAG_ATTENTION_LOG.clear()
+            self.lm_gen.use_sampling = default_use_sampling
+            if exp == "B":
+                diag_transformer.EXPERIMENT_FIX_BOUNDARY_OFFBYONE = True
+            elif exp == "C":
+                diag_transformer.EXPERIMENT_ROPE_REBASE_CONTEXT = loaders._lm_kwargs["context"]
+            elif exp == "D":
+                self.lm_gen.use_sampling = False
+            self.experiment = exp
+
+            # Fresh streaming state: reset_streaming() cascades to every StreamingModule
+            # descendant (mimi, other_mimi, lm_gen and every transformer layer's
+            # RingKVCache), zeroing offsets and cache-position counters exactly like a
+            # brand new connection would get, without tearing down/reallocating any CUDA
+            # graphs.
+            self.mimi.reset_streaming()
+            self.other_mimi.reset_streaming()
+            self.lm_gen.reset_streaming()
+
+            self._mark_progress(f"run_investigation_suite: experiment {exp} priming")
+            self.lm_gen.step_system_prompts(self.mimi)
+            persona_snapshot = self._snapshot_lm_gen_state()
+
+            # Fresh output files for this experiment: same stream names, isolated
+            # subdirectory, so A-F never overwrite each other's jsonl streams.
+            for fh in self._inv_fh.values():
+                fh.close()
+            exp_dir = os.path.join(self.investigate_dir, exp)
+            os.makedirs(exp_dir, exist_ok=True)
+            self._inv_dir = exp_dir
+            self._inv_fh = {
+                name: open(os.path.join(exp_dir, f"{name}.jsonl"), "a", encoding="utf-8")
+                for name in ("logits", "hidden_state", "attention", "ringkvcache", "rope", "pad_events")
+            }
+            self._diag_snapshot(conn_id, "session_start", elapsed=0.0)
+
+            inv_state = {
+                "recent_tokens": collections.deque(maxlen=50),
+                "entropy_values": [], "pad_prob_values": [], "hidden_norm_values": [],
+                "offsets_logged": [], "ringkv_mismatch_total": 0,
+                "entered": False, "finished": False,
+            }
+            inv_e_last_refresh_offset = 0
+            inv_f_reset_done = False
+            remaining_prefix = prefix_pcm_master
+            current_offset = self.lm_gen._streaming_state.offset
+
+            while current_offset <= max_offset:
+                if self.experiment == "E" and self.lm_gen.text_prompt_tokens and \
+                        current_offset - inv_e_last_refresh_offset >= self.experiment_e_refresh_interval:
+                    inv_e_last_refresh_offset = current_offset
+                    self.lm_gen._step_text_prompt()
+                    self._diag_event(conn_id, clog, "experiment_e_refresh", offset_before=current_offset)
+                    current_offset = self.lm_gen._streaming_state.offset
+                    continue
+                if self.experiment == "F" and not inv_f_reset_done and current_offset >= self.experiment_f_reset_at:
+                    inv_f_reset_done = True
+                    self._restore_lm_gen_state(persona_snapshot)
+                    self._diag_event(conn_id, clog, "experiment_f_reset", offset=current_offset)
+                    continue
+
+                if remaining_prefix is not None and remaining_prefix.shape[-1] > 0:
+                    chunk_np = remaining_prefix[:, : self.frame_size]
+                    remaining_prefix = remaining_prefix[:, self.frame_size:]
+                    if chunk_np.shape[-1] < self.frame_size:
+                        pad = np.zeros((chunk_np.shape[0], self.frame_size - chunk_np.shape[-1]), dtype=chunk_np.dtype)
+                        chunk_np = np.concatenate([chunk_np, pad], axis=-1)
+                    chunk = torch.from_numpy(chunk_np).float().to(self.device)[None]
+                else:
+                    chunk = torch.zeros(1, 1, self.frame_size, dtype=torch.float32, device=self.device)
+
+                self._mark_progress(f"run_investigation_suite: experiment {exp} encode (offset={current_offset})")
+                codes = self.mimi.encode(chunk)
+                _ = self.other_mimi.encode(chunk)
+
+                for c in range(codes.shape[-1]):
+                    current_offset = self.lm_gen._streaming_state.offset
+                    self._mark_progress(f"run_investigation_suite: experiment {exp} step (offset={current_offset})")
+
+                    if self.diag_probs:
+                        tokens, logits_pack = self.lm_gen.step(codes[:, :, c: c + 1])
+                        text_logits = logits_pack[0] if logits_pack is not None else None
+                    else:
+                        tokens = self.lm_gen.step(codes[:, :, c: c + 1])
+                        text_logits = None
+                    if tokens is None:
+                        continue
+
+                    text_token = tokens[0, 0, 0].item()
+                    elapsed = time.time() - exp_start
+                    self._inv_process_step(conn_id, clog, current_offset, elapsed, text_logits, text_token, inv_state)
+
+                current_offset = self.lm_gen._streaming_state.offset
+
+            if not inv_state["finished"]:
+                # max_offset was reached without the window ever closing on its own inside
+                # _inv_process_step (e.g. investigate_end wasn't actually reached) -- same
+                # fallback report-generation used for early client disconnects in
+                # handle_chat, so a report always exists for every requested experiment.
+                diag_transformer.DIAG_CAPTURE_ATTENTION = False
+                self._inv_save_pt_snapshot("after_silence_snapshot")
+                self._inv_generate_report(conn_id, inv_state)
+
+            report_path = os.path.join(exp_dir, f"investigation_report_{conn_id}_{exp}.md")
+            results[exp] = report_path
+            logger.info(f"=== experiment {exp} complete ({time.time() - exp_start:.1f}s): {report_path} ===")
+
+        diag_transformer.EXPERIMENT_FIX_BOUNDARY_OFFBYONE = False
+        diag_transformer.EXPERIMENT_ROPE_REBASE_CONTEXT = None
+        self.lm_gen.use_sampling = default_use_sampling
+        return results
+
     def warmup(self):
         for _ in range(4):
             chunk = torch.zeros(1, 1, self.frame_size, dtype=torch.float32, device=self.device)
@@ -1037,40 +1251,8 @@ class ServerState:
                                     self._diag_deep_dump_step(diag_conn_id, current_offset, elapsed, text_logits, text_token)
 
                             if self.investigate_collapse:
-                                in_window = self.investigate_start <= current_offset <= self.investigate_end
-                                if in_window and not inv_state["entered"]:
-                                    inv_state["entered"] = True
-                                    diag_transformer.DIAG_CAPTURE_ATTENTION = True
-                                    snap_path = self._inv_save_pt_snapshot("before_silence_snapshot")
-                                    self._diag_event(diag_conn_id, clog, "investigation_window_entered",
-                                                      offset=current_offset, snapshot=snap_path)
-                                if in_window and not inv_state["finished"]:
-                                    inv_state["offsets_logged"].append(current_offset)
-                                    if text_logits is not None:
-                                        pad_prob, entropy = self._inv_log_logits(
-                                            diag_conn_id, current_offset, elapsed, text_logits, text_token)
-                                        inv_state["pad_prob_values"].append(pad_prob)
-                                        inv_state["entropy_values"].append(entropy)
-                                        self._inv_check_pad_events(diag_conn_id, current_offset, elapsed, pad_prob, inv_state)
-                                    hnorm = self._inv_log_hidden(diag_conn_id, current_offset, elapsed, inv_state)
-                                    if hnorm is not None:
-                                        inv_state["hidden_norm_values"].append(hnorm)
-                                    self._inv_log_attention(diag_conn_id, current_offset, elapsed)
-                                    inv_state["ringkv_mismatch_total"] += self._inv_log_ringkvcache(
-                                        diag_conn_id, current_offset, elapsed)
-                                    self._inv_log_rope(diag_conn_id, current_offset, elapsed)
-                                    piece = ("PAD" if text_token == self.lm_gen.zero_text_code
-                                              else "EPAD" if text_token == 0
-                                              else self.text_tokenizer.id_to_piece(text_token).replace("▁", " "))
-                                    inv_state["recent_tokens"].append(piece)
-                                elif current_offset > self.investigate_end and not inv_state["finished"]:
-                                    inv_state["finished"] = True
-                                    diag_transformer.DIAG_CAPTURE_ATTENTION = False
-                                    after_path = self._inv_save_pt_snapshot("after_silence_snapshot")
-                                    report_path = self._inv_generate_report(diag_conn_id, inv_state)
-                                    self._diag_event(diag_conn_id, clog, "investigation_window_finished",
-                                                      offset=current_offset, snapshot=after_path, report=report_path)
-                                    clog.log("warning", f"INVESTIGATION COMPLETE: report written to {report_path}")
+                                self._inv_process_step(diag_conn_id, clog, current_offset, elapsed,
+                                                        text_logits, text_token, inv_state)
 
                             if text_token == 0:
                                 epad_tokens_since_report += 1
@@ -1476,6 +1658,28 @@ def main():
                         help="Experiment E: steps between persona-refresh reinjections. Default 500.")
     parser.add_argument("--experiment-f-reset-at", type=int, default=5000,
                         help="Experiment F: state.offset at which the one-time reset fires. Default 5000.")
+    parser.add_argument("--run-investigation-suite", action="store_true",
+                        help="Instead of starting the live websocket server, run experiments A-F "
+                             "back-to-back in-process (one model load) with a synthetic silence-driven "
+                             "audio feed and exit. Implies --investigate-collapse. Requires "
+                             "--suite-voice-prompt. Results land under --investigate-dir/<experiment>/.")
+    parser.add_argument("--suite-voice-prompt", type=str, default=None,
+                        help="Voice prompt filename (looked up under --voice-prompt-dir, same as a "
+                             "live connection's ?voice_prompt=) or full path (if it ends in .pt), used "
+                             "for every experiment in --run-investigation-suite.")
+    parser.add_argument("--suite-text-prompt", type=str, default="",
+                        help="System/persona text prompt used for every experiment in "
+                             "--run-investigation-suite.")
+    parser.add_argument("--suite-experiments", type=str, default="A,B,C,D,E,F",
+                        help="Comma-separated subset of experiments to run, e.g. 'A,B'. Default: all six.")
+    parser.add_argument("--suite-max-offset", type=int, default=None,
+                        help="state.offset at which each experiment's synthetic run stops. Defaults to "
+                             "--investigate-end + 200 (just past the window, so the report is always "
+                             "generated from the in-window completion path rather than the fallback).")
+    parser.add_argument("--suite-input-wav", type=str, default=None,
+                        help="Optional real recording to play first in each experiment (for a more "
+                             "realistic transcript); silence still fills the rest up to "
+                             "--suite-max-offset. Omit for a pure-silence run (default).")
     parser.add_argument(
         "--voice-prompt-dir",
         type=str,
@@ -1495,6 +1699,9 @@ def main():
     )
 
     args = parser.parse_args()
+
+    if args.run_investigation_suite:
+        args.investigate_collapse = True  # suite mode always needs the full instrumentation
 
     if args.investigate_collapse:
         # Must happen before any model is loaded/warmed up: CUDAGraphed captures its
@@ -1600,6 +1807,25 @@ def main():
                     f"output dir={args.investigate_dir}")
     logger.info("warming up the model")
     state.warmup()
+
+    if args.run_investigation_suite:
+        if not args.suite_voice_prompt:
+            logger.error("--run-investigation-suite requires --suite-voice-prompt")
+            sys.exit(1)
+        suite_experiments = [e.strip() for e in args.suite_experiments.split(",") if e.strip()]
+        logger.info(f"running investigation suite: experiments={suite_experiments}")
+        results = state.run_investigation_suite(
+            voice_prompt_filename=args.suite_voice_prompt,
+            text_prompt=args.suite_text_prompt,
+            experiments=suite_experiments,
+            max_offset=args.suite_max_offset,
+            input_wav_path=args.suite_input_wav,
+        )
+        logger.info("investigation suite complete:")
+        for exp, path in results.items():
+            logger.info(f"  {exp}: {path}")
+        return
+
     threading.Thread(target=state._watchdog_loop, daemon=True, name="hang-watchdog").start()
     app = web.Application()
     app.router.add_get("/api/chat", state.handle_chat)
