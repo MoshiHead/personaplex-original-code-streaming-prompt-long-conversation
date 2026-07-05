@@ -286,6 +286,16 @@ class RingKVCache:
         self.end_offset = torch.zeros(1, device=device, dtype=torch.long)
 
     def reset(self):
+        # Zero the actual K/V contents, not just the end_offset pointer: end_offset alone
+        # governs which slots the causal mask treats as valid, but any code path that reads
+        # a slot the mask incorrectly considers valid (e.g. the boundary off-by-one this
+        # cache already has a known instance of, see complete()/verify_boundary_slot()) would
+        # otherwise see stale values left over from whatever ran before this reset -- across
+        # a fresh live connection this was never observed because each connection got a
+        # freshly-allocated model process, but run_investigation_suite reuses one process
+        # across all six experiments back-to-back, so leftover cache content from a prior
+        # experiment is a real, reachable state here in a way it wasn't before.
+        self.cache.zero_()
         self.end_offset.zero_()
 
     def stats(self, deep: bool = False) -> dict:

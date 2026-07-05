@@ -56,6 +56,7 @@ from .models import loaders, MimiModel, LMModel, LMGen
 from .models.lm import load_audio
 from .modules import transformer as diag_transformer
 from .modules.streaming import _flatten_streaming_state
+from .session_recorder import SessionRecorder
 from .utils.connection import create_ssl_context, get_lan_ip
 from .utils.logging import setup_logger, ColorizedLog, random_id
 
@@ -111,7 +112,9 @@ class ServerState:
                  investigate_collapse: bool = False, investigate_start: int = 5500,
                  investigate_end: int = 6500, investigate_dir: str = "runtime_logs",
                  experiment: str = "A", experiment_e_refresh_interval: int = 500,
-                 experiment_f_reset_at: int = 5000):
+                 experiment_f_reset_at: int = 5000,
+                 enable_session_recording: bool = True, session_root: str = "runtime_logs",
+                 enable_attention_recording: bool = False):
         self.mimi = mimi
         self.other_mimi = other_mimi
         self.text_tokenizer = text_tokenizer
@@ -119,7 +122,6 @@ class ServerState:
         self.voice_prompt_dir = voice_prompt_dir
         self.mute_recovery_secs = mute_recovery_secs
         self.diag_interval_secs = diag_interval_secs
-        self.diag_probs = diag_probs or investigate_collapse  # investigation always needs logits
         self.diag_dir = diag_dir
         self.diag_dump_near = diag_dump_near
         self.diag_dump_radius = diag_dump_radius
@@ -130,6 +132,15 @@ class ServerState:
         self.experiment = experiment
         self.experiment_e_refresh_interval = experiment_e_refresh_interval
         self.experiment_f_reset_at = experiment_f_reset_at
+        self.enable_session_recording = enable_session_recording
+        self.session_root = session_root
+        self.enable_attention_recording = enable_attention_recording
+        # The always-on black-box recorder needs per-step logits (for PAD/entropy) and the
+        # real hidden-state tensor (for cosine-sim/L2-distance, not just its norm) -- both
+        # are graph-safe (see session_recorder.py's module docstring for why), so turning
+        # session recording on forces the same flags --investigate-collapse already forces
+        # for the same reason.
+        self.diag_probs = diag_probs or investigate_collapse or enable_session_recording
         self.frame_size = int(self.mimi.sample_rate / self.mimi.frame_rate)
         self.lm_gen = LMGen(lm,
                             audio_silence_frame_cnt=int(0.5 * self.mimi.frame_rate),
@@ -139,8 +150,8 @@ class ServerState:
                             save_voice_prompt_embeddings=save_voice_prompt_embeddings,
                             return_logits=self.diag_probs,
         )
-        self.lm_gen.diag_track_norms = diag_track_norms or investigate_collapse
-        self.lm_gen.diag_keep_hidden_tensor = investigate_collapse
+        self.lm_gen.diag_track_norms = diag_track_norms or investigate_collapse or enable_session_recording
+        self.lm_gen.diag_keep_hidden_tensor = investigate_collapse or enable_session_recording
         if experiment == "D":
             # Experiment D: force greedy decoding. use_sampling is an existing, already-
             # supported LMGen constructor flag -- no new mechanism needed, just flipped.
@@ -464,12 +475,32 @@ class ServerState:
         diag_transformer.DIAG_ATTENTION_LOG.clear()
         if not entries:
             return
+        # DIAG_CAPTURE_ATTENTION and DIAG_ATTENTION_LOG are module-level globals in
+        # transformer.py, so EVERY StreamingMultiheadAttention in the process feeds this
+        # same list while capture is on -- not just the main LM transformer's 32 layers,
+        # but also the depformer's own layers (small, autoregressive-local "offset" values
+        # like 0-15, unrelated to the main sequence position) and, per-step, both mimi and
+        # other_mimi's internal transformers (byte-identical entries, since both encode the
+        # same silence chunk -- this is why raw entries can contain exact duplicates and
+        # stray "offset" values wildly different from this step's real offset). diag_layer_idx
+        # is assigned per-instance starting at 0 in StreamingTransformer.__init__, so a
+        # depformer/mimi layer 3 is indistinguishable from main-transformer layer 3 by index
+        # alone -- offset equality against this step's real offset is the only reliable way
+        # to isolate the main transformer's entries for per-step analysis.
+        #
+        # The main transformer's own internal offset (read inside StreamingMultiheadAttention.
+        # forward, before this call's token has been folded into its count) is consistently
+        # one behind LMGen's `offset` (read here, already advanced to include this token) --
+        # confirmed empirically across every step of every experiment in the first suite run,
+        # never off by any other amount. Filter against `offset - 1`, not `offset`.
+        main_entries = [e for e in entries if e["offset"] == offset - 1]
         self._inv_write("attention", {
             "record_type": "attention", "conn_id": conn_id, "offset": offset, "elapsed_s": round(elapsed, 2),
-            "layers": entries,
-            "entropy_mean_across_layers": sum(e["entropy_mean"] for e in entries) / len(entries),
-            "max_weight_mean_across_layers": sum(e["max_weight_mean"] for e in entries) / len(entries),
-            "active_kv_mean_across_layers": sum(e["active_kv_entries"] for e in entries) / len(entries),
+            "layers": main_entries,
+            "non_main_entries_discarded": len(entries) - len(main_entries),
+            "entropy_mean_across_layers": (sum(e["entropy_mean"] for e in main_entries) / len(main_entries)) if main_entries else None,
+            "max_weight_mean_across_layers": (sum(e["max_weight_mean"] for e in main_entries) / len(main_entries)) if main_entries else None,
+            "active_kv_mean_across_layers": (sum(e["active_kv_entries"] for e in main_entries) / len(main_entries)) if main_entries else None,
         })
 
     def _inv_log_ringkvcache(self, conn_id: str, offset: int, elapsed: float) -> int:
@@ -776,6 +807,16 @@ class ServerState:
                 self.lm_gen.use_sampling = False
             self.experiment = exp
 
+            # Re-seed before every experiment: sampling (torch.multinomial in sample_token)
+            # draws from the global RNG, and without this all six experiments would share one
+            # continuously-advancing RNG stream across the whole suite -- so a later
+            # experiment's results would be confounded by how many random draws every earlier
+            # experiment happened to consume, not just by its own code differences. This makes
+            # A vs. B vs. C vs. D vs. E an actual controlled comparison (same seed, same
+            # silence input, only the flagged mechanism differs) rather than one long
+            # accumulating random walk.
+            seed_all(42424242)
+
             # Fresh streaming state: reset_streaming() cascades to every StreamingModule
             # descendant (mimi, other_mimi, lm_gen and every transformer layer's
             # RingKVCache), zeroing offsets and cache-position counters exactly like a
@@ -823,8 +864,13 @@ class ServerState:
                     continue
                 if self.experiment == "F" and not inv_f_reset_done and current_offset >= self.experiment_f_reset_at:
                     inv_f_reset_done = True
-                    self._restore_lm_gen_state(persona_snapshot)
                     self._diag_event(conn_id, clog, "experiment_f_reset", offset=current_offset)
+                    self._restore_lm_gen_state(persona_snapshot)
+                    # The restore jumps state.offset back down to whatever it was when
+                    # persona_snapshot was taken (right after priming) -- resync the local
+                    # variable immediately so the while-loop condition and the next E/F check
+                    # see the true post-restore offset, not the stale pre-restore one.
+                    current_offset = self.lm_gen._streaming_state.offset
                     continue
 
                 if remaining_prefix is not None and remaining_prefix.shape[-1] > 0:
@@ -877,6 +923,200 @@ class ServerState:
         diag_transformer.EXPERIMENT_ROPE_REBASE_CONTEXT = None
         self.lm_gen.use_sampling = default_use_sampling
         return results
+
+    def run_causal_probe(
+        self,
+        voice_prompt_filename: str,
+        text_prompt: str,
+        snapshot_offsets: Optional[list] = None,
+        continuation_steps: int = 300,
+        recovered_pad_prob_threshold: float = 0.5,
+        force_reference_feedback: bool = False,
+        reference_offset: int = 1000,
+        probe_start: int = 5800,
+        probe_end: int = 6300,
+        probe_dir: str = "causal_probe",
+    ) -> dict:
+        """Two causal tests the offset/PAD-probability change-point analysis alone cannot
+        answer, both requested explicitly rather than inferred from more static reading:
+
+        1. Recoverability binary search (steps 6/7 of the causal-investigation request):
+           saves a full state snapshot at every offset in `snapshot_offsets`. After
+           reaching `probe_end` normally, restores from each snapshot in turn and runs
+           `continuation_steps` more silence-driven steps from it, recording whether PAD
+           probability in that continuation comes back down (mean < threshold -- treated
+           as "recoverable") or stays locked (treated as "unrecoverable"). The boundary
+           between the last recoverable and first unrecoverable snapshot is the
+           empirical point of no return, not an assumed one.
+
+        2. Reference-feedback intervention (step 5's actual intervention, not just
+           observation), gated behind `force_reference_feedback`: captures the model's own
+           (moshi_tokens, text_token) output at `reference_offset` -- well before the
+           change-point region, while output still looks normal -- then, for every step
+           between `probe_start` and `probe_end`, calls `lm_gen.step(...)` with that FIXED
+           reference explicitly passed as `moshi_tokens=`/`text_token=`, instead of leaving
+           them None (which is what lets the model feed its own most recent output back to
+           itself). This is the same override mechanism `_step_voice_prompt_frame` and
+           `_step_text_prompt_core` already use to force specific tokens, so the plumbing
+           is proven; what's untested is only this specific use of it. If the same
+           representational drift still appears in hidden_state/logits with the feedback
+           pinned to a known-healthy reference, the drift does not depend on the model
+           consuming its own degrading output -- ruling out feedback as the causal
+           mechanism. If the drift disappears or is delayed, feedback is implicated.
+           Left off by default: this is the least-proven piece of this suite, unlike (1)
+           which only reuses already-validated mute-recovery machinery.
+        """
+        assert self.diag_probs, (
+            "run_causal_probe requires return_logits/diag_probs (construct ServerState with "
+            "investigate_collapse=True) -- otherwise lm_gen.step() returns a plain tensor, not "
+            "the (tokens, logits) tuple this method unconditionally unpacks."
+        )
+        if snapshot_offsets is None:
+            snapshot_offsets = [5900, 5950, 6000, 6020, 6030, 6032, 6033, 6034, 6040, 6050, 6100]
+        snapshot_offsets = sorted(set(snapshot_offsets))
+
+        voice_prompt_path = (os.path.join(self.voice_prompt_dir, voice_prompt_filename)
+                              if self.voice_prompt_dir else voice_prompt_filename)
+        if voice_prompt_path.endswith(".pt"):
+            self.lm_gen.load_voice_prompt_embeddings(voice_prompt_path)
+        else:
+            self.lm_gen.load_voice_prompt(voice_prompt_path)
+        self.lm_gen.text_prompt_tokens = (
+            self.text_tokenizer.encode(wrap_with_system_tags(text_prompt)) if text_prompt else None
+        )
+
+        os.makedirs(probe_dir, exist_ok=True)
+        clog = ColorizedLog.randomize()
+        conn_id = "causal_probe"
+
+        self.mimi.reset_streaming()
+        self.other_mimi.reset_streaming()
+        self.lm_gen.reset_streaming()
+        seed_all(42424242)
+        self.lm_gen.step_system_prompts(self.mimi)
+
+        reference_moshi_tokens = None
+        reference_text_token = None
+        snapshots: dict = {}
+        pad_probs_by_offset: dict = {}
+
+        current_offset = self.lm_gen._streaming_state.offset
+        max_offset = max(snapshot_offsets[-1], probe_end) + 5
+        logger.info(f"causal_probe: main pass to offset {max_offset}, "
+                    f"snapshotting at {snapshot_offsets}, "
+                    f"force_reference_feedback={force_reference_feedback}")
+
+        while current_offset <= max_offset:
+            chunk = torch.zeros(1, 1, self.frame_size, dtype=torch.float32, device=self.device)
+            codes = self.mimi.encode(chunk)
+            _ = self.other_mimi.encode(chunk)
+
+            for c in range(codes.shape[-1]):
+                current_offset = self.lm_gen._streaming_state.offset
+                self._mark_progress(f"causal_probe: main pass step (offset={current_offset})")
+
+                use_reference = (
+                    force_reference_feedback
+                    and reference_moshi_tokens is not None
+                    and probe_start <= current_offset <= probe_end
+                )
+                if use_reference:
+                    tokens, logits_pack = self.lm_gen.step(
+                        codes[:, :, c: c + 1],
+                        moshi_tokens=reference_moshi_tokens,
+                        text_token=reference_text_token,
+                    )
+                else:
+                    tokens, logits_pack = self.lm_gen.step(codes[:, :, c: c + 1])
+                if tokens is None:
+                    continue
+                text_logits = logits_pack[0] if logits_pack is not None else None
+
+                if current_offset == reference_offset:
+                    # moshi_tokens must be a [B, 8, 1] tensor (prepare_step_input asserts
+                    # dim()==3) -- tokens[:, 1:9] already has exactly that shape, the same
+                    # slice mimi.decode() uses elsewhere in this file. text_token, by
+                    # contrast, is assigned into a [B]-shaped cache slot and is used
+                    # elsewhere in this codebase as a plain Python int (e.g.
+                    # text_token=self.zero_text_code in _step_voice_prompt_frame) -- kept as
+                    # a bare int here too, rather than a [B,1] tensor slice that would
+                    # broadcast against a [B] target incorrectly for B>1.
+                    reference_moshi_tokens = tokens[:, 1:9].clone()
+                    reference_text_token = tokens[0, 0, 0].item()
+                    self._diag_event(conn_id, clog, "causal_probe_reference_captured",
+                                      offset=current_offset)
+
+                if text_logits is not None:
+                    probs = torch.softmax(text_logits.float() / self.lm_gen.temp_text, dim=-1)
+                    pad_probs_by_offset[current_offset] = float(
+                        probs[0, 0, 0, self.lm_gen.zero_text_code].item())
+
+                if current_offset in snapshot_offsets and current_offset not in snapshots:
+                    path = os.path.join(probe_dir, f"snapshot_offset_{current_offset}.pt")
+                    torch.save(self._snapshot_lm_gen_state(), path)
+                    snapshots[current_offset] = path
+                    self._diag_event(conn_id, clog, "causal_probe_snapshot_saved",
+                                      offset=current_offset, path=path)
+
+        # --- recoverability binary search: restore each snapshot, continue, measure PAD prob ---
+        recovery_results = []
+        for off in snapshot_offsets:
+            if off not in snapshots:
+                continue
+            self._restore_lm_gen_state(torch.load(snapshots[off]))
+            self._mark_progress(f"causal_probe: recoverability continuation from offset {off}")
+            continuation_pad_probs = []
+            steps_run = 0
+            start_offset = self.lm_gen._streaming_state.offset
+            while steps_run < continuation_steps:
+                chunk = torch.zeros(1, 1, self.frame_size, dtype=torch.float32, device=self.device)
+                codes = self.mimi.encode(chunk)
+                _ = self.other_mimi.encode(chunk)
+                for c in range(codes.shape[-1]):
+                    tokens, logits_pack = self.lm_gen.step(codes[:, :, c: c + 1])
+                    steps_run += 1
+                    if tokens is None or logits_pack is None or logits_pack[0] is None:
+                        continue
+                    probs = torch.softmax(logits_pack[0].float() / self.lm_gen.temp_text, dim=-1)
+                    continuation_pad_probs.append(
+                        float(probs[0, 0, 0, self.lm_gen.zero_text_code].item()))
+                    if steps_run >= continuation_steps:
+                        break
+            mean_pad = sum(continuation_pad_probs) / len(continuation_pad_probs) if continuation_pad_probs else None
+            recovered = mean_pad is not None and mean_pad < recovered_pad_prob_threshold
+            recovery_results.append({
+                "snapshot_offset": off,
+                "continuation_start_offset": start_offset,
+                "steps_run": steps_run,
+                "mean_pad_prob_in_continuation": mean_pad,
+                "recovered": recovered,
+            })
+            self._diag_event(conn_id, clog, "causal_probe_recovery_test",
+                              snapshot_offset=off, mean_pad_prob=mean_pad, recovered=recovered)
+            logger.info(f"causal_probe: restore@{off} -> mean PAD prob over next "
+                        f"{continuation_steps} steps = {mean_pad}, recovered={recovered}")
+
+        last_recoverable = max([r["snapshot_offset"] for r in recovery_results if r["recovered"]], default=None)
+        first_unrecoverable = min([r["snapshot_offset"] for r in recovery_results if not r["recovered"]], default=None)
+
+        summary = {
+            "snapshot_offsets_requested": snapshot_offsets,
+            "snapshot_offsets_captured": sorted(snapshots.keys()),
+            "reference_offset": reference_offset,
+            "reference_captured": reference_moshi_tokens is not None,
+            "force_reference_feedback": force_reference_feedback,
+            "probe_window": [probe_start, probe_end],
+            "recovery_results": recovery_results,
+            "last_recoverable_offset": last_recoverable,
+            "first_unrecoverable_offset": first_unrecoverable,
+            "pad_prob_by_offset": pad_probs_by_offset,
+        }
+        summary_path = os.path.join(probe_dir, "causal_probe_summary.json")
+        with open(summary_path, "w", encoding="utf-8") as f:
+            json.dump(summary, f, indent=2, default=str)
+        logger.info(f"causal_probe complete: last_recoverable={last_recoverable} "
+                    f"first_unrecoverable={first_unrecoverable} -> {summary_path}")
+        return summary
 
     def warmup(self):
         for _ in range(4):
@@ -975,6 +1215,23 @@ class ServerState:
             "entered": False, "finished": False,
         }
 
+        # Always-on black-box session recorder (see session_recorder.py) -- one per
+        # connection, closed in the finally block below so a report is always generated
+        # even if the connection drops or raises partway through.
+        recorder = None
+        if self.enable_session_recording:
+            recorder = SessionRecorder(
+                session_root=self.session_root,
+                lm_gen=self.lm_gen,
+                text_tokenizer=self.text_tokenizer,
+                sample_rate=self.mimi.sample_rate,
+                conn_id=diag_conn_id,
+                voice_prompt=voice_prompt_path,
+                text_prompt=request.query.get("text_prompt"),
+                enable_attention_recording=self.enable_attention_recording,
+                logger=clog,
+            )
+
         async def recv_loop():
             nonlocal close
             try:
@@ -1007,11 +1264,15 @@ class ServerState:
             except Exception as exc:
                 self._diag_event(diag_conn_id, clog, "exception", where="recv_loop",
                                   exception=repr(exc), traceback=traceback.format_exc())
+                if recorder is not None:
+                    recorder.record_exception(self.lm_gen._streaming_state.offset if self.lm_gen.is_streaming else 0, exc)
                 raise
             finally:
                 close = True
                 self._diag_event(diag_conn_id, clog, "websocket_disconnect",
                                   where="recv_loop", ws_closed=ws.closed)
+                if recorder is not None:
+                    recorder.record_disconnect(self.lm_gen._streaming_state.offset if self.lm_gen.is_streaming else 0)
                 clog.log("info", "connection closed")
 
         async def opus_loop():
@@ -1136,6 +1397,8 @@ class ServerState:
                 pcm = opus_reader.read_pcm()
                 if pcm.shape[-1] == 0:
                     continue
+                if recorder is not None:
+                    recorder.record_input_pcm(pcm)
                 diag_state["pcm_frames_received"] += pcm.shape[-1]
                 if all_pcm_data is None:
                     all_pcm_data = pcm
@@ -1221,6 +1484,8 @@ class ServerState:
                             self._mark_progress("opus_loop: opus_writer.append_pcm")
                             pcm_out = main_pcm[0, 0].numpy()
                             opus_writer.append_pcm(pcm_out)
+                            if recorder is not None:
+                                recorder.record_output_pcm(pcm_out)
                             frame_rms = float(np.sqrt(np.mean(np.square(pcm_out))))
                             frame_peak = float(np.abs(pcm_out).max()) if pcm_out.size else 0.0
                             out_sq_sum += float(np.square(pcm_out).sum())
@@ -1254,6 +1519,19 @@ class ServerState:
                                 self._inv_process_step(diag_conn_id, clog, current_offset, elapsed,
                                                         text_logits, text_token, inv_state)
 
+                            if recorder is not None:
+                                fired = recorder.record_step(
+                                    offset=current_offset, elapsed_s=elapsed, text_logits=text_logits,
+                                    sampled_text_token=text_token,
+                                    hidden_state=self.lm_gen._diag_last_hidden_state,
+                                    latency_ms=(time.time() - t_lm) * 1000.0,
+                                    audio_rms=frame_rms, ringkv_capacity=capacity,
+                                    snapshot_fn=self._snapshot_lm_gen_state,
+                                )
+                                if fired:
+                                    clog.log("warning", f"session_recorder: event(s) fired at "
+                                                          f"offset={current_offset}: {fired}")
+
                             if text_token == 0:
                                 epad_tokens_since_report += 1
                             elif text_token == self.lm_gen.zero_text_code:  # 3 == PAD
@@ -1264,6 +1542,8 @@ class ServerState:
                                 silence_event_fired = False
                                 _text = self.text_tokenizer.id_to_piece(text_token)  # type: ignore
                                 _text = _text.replace("▁", " ")
+                                if recorder is not None:
+                                    recorder.record_text_token(_text)
                                 msg = b"\x02" + bytes(_text, encoding="utf8")
                                 self._mark_progress("opus_loop: ws.send_bytes (text)")
                                 await ws.send_bytes(msg)
@@ -1306,6 +1586,9 @@ class ServerState:
                     except Exception as exc:
                         self._diag_event(diag_conn_id, clog, "exception", where="opus_loop",
                                           exception=repr(exc), traceback=traceback.format_exc())
+                        if recorder is not None:
+                            recorder.record_exception(
+                                self.lm_gen._streaming_state.offset if self.lm_gen.is_streaming else 0, exc)
                         raise
 
                 now = time.time()
@@ -1404,6 +1687,8 @@ class ServerState:
             except Exception as exc:
                 self._diag_event(diag_conn_id, clog, "exception", where="send_loop",
                                   exception=repr(exc), traceback=traceback.format_exc())
+                if recorder is not None:
+                    recorder.record_exception(self.lm_gen._streaming_state.offset if self.lm_gen.is_streaming else 0, exc)
                 raise
 
         clog.log("info", "accepted connection")
@@ -1493,6 +1778,12 @@ class ServerState:
             report_path = self._inv_generate_report(diag_conn_id, inv_state)
             clog.log("warning", f"INVESTIGATION (session ended before window closed): "
                                  f"report written to {report_path}")
+        if recorder is not None:
+            # Always closed here, whether the session ended cleanly, via disconnect, or
+            # via an exception surfaced above -- so session_report.md is generated for
+            # every connection, not just ones that happen to exit cleanly.
+            session_report_path = recorder.close()
+            clog.log("info", f"session_recorder: {recorder.session_id} report -> {session_report_path}")
         self._mark_progress("idle")
         clog.log("info", "done with connection")
         return ws
@@ -1658,6 +1949,23 @@ def main():
                         help="Experiment E: steps between persona-refresh reinjections. Default 500.")
     parser.add_argument("--experiment-f-reset-at", type=int, default=5000,
                         help="Experiment F: state.offset at which the one-time reset fires. Default 5000.")
+    parser.add_argument("--disable-session-recording", action="store_true",
+                        help="Turn off the always-on black-box session recorder (see session_recorder.py) "
+                             "for every live connection. On by default: every connection gets its own "
+                             "runtime_logs/session_NNN/ with a per-step log, automatic anomaly detection, "
+                             "on-anomaly snapshots, input/output audio, transcript, and an auto-generated "
+                             "session_report.md when the connection ends. The always-on part is cheap "
+                             "(graph-safe scalars only); pass this flag to disable it entirely if even "
+                             "that overhead is unwanted.")
+    parser.add_argument("--session-root", type=str, default="runtime_logs",
+                        help="Directory under which session_NNN/ folders are created. Default './runtime_logs'.")
+    parser.add_argument("--enable-attention-recording", action="store_true",
+                        help="Also attempt per-layer attention capture in the always-on recorder. Requires "
+                             "NO_CUDA_GRAPH=1 (forced automatically if this is set) because a CUDA-graph- "
+                             "replayed layer's Python-level forward never re-runs during replay -- there is "
+                             "no way to read per-layer attention without this trade-off. Expect materially "
+                             "reduced throughput for the whole server process, not just one session -- off "
+                             "by default for exactly that reason.")
     parser.add_argument("--run-investigation-suite", action="store_true",
                         help="Instead of starting the live websocket server, run experiments A-F "
                              "back-to-back in-process (one model load) with a synthetic silence-driven "
@@ -1680,6 +1988,39 @@ def main():
                         help="Optional real recording to play first in each experiment (for a more "
                              "realistic transcript); silence still fills the rest up to "
                              "--suite-max-offset. Omit for a pure-silence run (default).")
+    parser.add_argument("--run-causal-probe", action="store_true",
+                        help="Instead of the live server or the A-F suite, run the causal-timeline "
+                             "probe: snapshot/restore recoverability binary search (always), plus an "
+                             "optional reference-feedback intervention (--probe-force-reference-"
+                             "feedback). Implies --investigate-collapse. Requires --suite-voice-prompt.")
+    parser.add_argument("--probe-snapshot-offsets", type=str,
+                        default="5900,5950,6000,6020,6030,6032,6033,6034,6040,6050,6100",
+                        help="Comma-separated offsets to snapshot during the main pass, then restore "
+                             "and continue from during the recoverability test.")
+    parser.add_argument("--probe-continuation-steps", type=int, default=300,
+                        help="Steps to run after restoring each snapshot, to measure whether PAD "
+                             "probability comes back down (recovered) or stays locked. Default 300.")
+    parser.add_argument("--probe-recovered-pad-threshold", type=float, default=0.5,
+                        help="A restored snapshot counts as 'recovered' if its continuation's mean "
+                             "PAD probability is below this. Default 0.5.")
+    parser.add_argument("--probe-force-reference-feedback", action="store_true",
+                        help="Also run the reference-feedback intervention: pin the model's own "
+                             "fed-back tokens to a fixed reference captured at --probe-reference-offset "
+                             "for every step in [--probe-start, --probe-end], instead of letting it "
+                             "feed back its own (possibly degrading) output. Off by default -- this is "
+                             "the least-proven piece of this suite; verify the first run carefully.")
+    parser.add_argument("--probe-reference-offset", type=int, default=1000,
+                        help="Offset to capture the reference (moshi_tokens, text_token) from, for "
+                             "--probe-force-reference-feedback. Should be well before the change-point "
+                             "region. Default 1000.")
+    parser.add_argument("--probe-start", type=int, default=5800,
+                        help="Start of the reference-feedback intervention window. Default 5800.")
+    parser.add_argument("--probe-end", type=int, default=6300,
+                        help="End of the reference-feedback intervention window, and the offset the "
+                             "main pass runs past before starting the recoverability test. Default 6300.")
+    parser.add_argument("--probe-dir", type=str, default="causal_probe",
+                        help="Directory for causal_probe_summary.json and snapshot_offset_*.pt files. "
+                             "Default './causal_probe'.")
     parser.add_argument(
         "--voice-prompt-dir",
         type=str,
@@ -1700,8 +2041,16 @@ def main():
 
     args = parser.parse_args()
 
-    if args.run_investigation_suite:
-        args.investigate_collapse = True  # suite mode always needs the full instrumentation
+    if args.run_investigation_suite or args.run_causal_probe:
+        args.investigate_collapse = True  # both modes always need the full instrumentation
+
+    if args.enable_attention_recording and not args.investigate_collapse:
+        # Same reasoning as --investigate-collapse below: must happen before model load,
+        # and per-layer attention capture fundamentally requires eager mode.
+        os.environ["NO_CUDA_GRAPH"] = "1"
+        diag_transformer.DIAG_CAPTURE_ATTENTION = True
+        logger.warning("--enable-attention-recording: forcing NO_CUDA_GRAPH=1 for the whole "
+                        "server process. Expect reduced throughput for every session.")
 
     if args.investigate_collapse:
         # Must happen before any model is loaded/warmed up: CUDAGraphed captures its
@@ -1794,6 +2143,9 @@ def main():
         experiment=args.experiment,
         experiment_e_refresh_interval=args.experiment_e_refresh_interval,
         experiment_f_reset_at=args.experiment_f_reset_at,
+        enable_session_recording=not args.disable_session_recording,
+        session_root=args.session_root,
+        enable_attention_recording=args.enable_attention_recording,
     )
     if args.diag_dump_near > 0 and not args.diag_probs:
         logger.warning("--diag-dump-near requires --diag-probs to actually capture logits; "
@@ -1805,6 +2157,12 @@ def main():
         logger.info(f"investigation mode ON: experiment={args.experiment}, "
                     f"window=[{args.investigate_start}, {args.investigate_end}], "
                     f"output dir={args.investigate_dir}")
+    if state.enable_session_recording:
+        logger.info(f"session recording ON (black box): every connection gets its own "
+                    f"{args.session_root}/session_NNN/, attention_recording="
+                    f"{args.enable_attention_recording}")
+    else:
+        logger.info("session recording OFF (--disable-session-recording)")
     logger.info("warming up the model")
     state.warmup()
 
@@ -1824,6 +2182,30 @@ def main():
         logger.info("investigation suite complete:")
         for exp, path in results.items():
             logger.info(f"  {exp}: {path}")
+        return
+
+    if args.run_causal_probe:
+        if not args.suite_voice_prompt:
+            logger.error("--run-causal-probe requires --suite-voice-prompt")
+            sys.exit(1)
+        snapshot_offsets = [int(x.strip()) for x in args.probe_snapshot_offsets.split(",") if x.strip()]
+        logger.info(f"running causal probe: snapshot_offsets={snapshot_offsets} "
+                    f"force_reference_feedback={args.probe_force_reference_feedback}")
+        summary = state.run_causal_probe(
+            voice_prompt_filename=args.suite_voice_prompt,
+            text_prompt=args.suite_text_prompt,
+            snapshot_offsets=snapshot_offsets,
+            continuation_steps=args.probe_continuation_steps,
+            recovered_pad_prob_threshold=args.probe_recovered_pad_threshold,
+            force_reference_feedback=args.probe_force_reference_feedback,
+            reference_offset=args.probe_reference_offset,
+            probe_start=args.probe_start,
+            probe_end=args.probe_end,
+            probe_dir=args.probe_dir,
+        )
+        logger.info(f"causal probe complete: last_recoverable_offset="
+                    f"{summary['last_recoverable_offset']} first_unrecoverable_offset="
+                    f"{summary['first_unrecoverable_offset']}")
         return
 
     threading.Thread(target=state._watchdog_loop, daemon=True, name="hang-watchdog").start()
